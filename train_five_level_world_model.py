@@ -27,7 +27,15 @@ from chreode_loss import ChreodeLossConfig, chreode_population_loss
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--level", type=int, choices=[1, 2, 3, 4, 5, 6], default=2)
+    parser.add_argument(
+        "--level",
+        type=int,
+        choices=[0, 1, 2, 3, 4, 5, 6],
+        default=2,
+        help="0 is the non-learned identity baseline (predicts no change); it has no "
+        "trainable transition parameters and serves as the sanity floor for every "
+        "other level.",
+    )
     parser.add_argument(
         "--variant",
         choices=[
@@ -83,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-time-delta", type=float, default=1.0)
     parser.add_argument("--expression-transform", choices=["none", "log1p_10k"], default="none")
     parser.add_argument("--group-column", type=str, default=None)
+    parser.add_argument(
+        "--technology-lookup",
+        type=Path,
+        default=None,
+        help="TSV with dataset_id/technology columns. Required only when the Stage-1 "
+        "scVI checkpoint was trained with a technology filter or --batch-key technology; "
+        "the filter and batch key themselves are read from the checkpoint so the two "
+        "stages cannot disagree.",
+    )
     parser.add_argument("--sample-by-probability", action="store_true")
     parser.add_argument("--no-probability-weight", action="store_true")
 
@@ -160,7 +177,8 @@ def save_checkpoint(
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            # None for the level-0 identity baseline, which has no optimizer.
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "step": step,
             "epoch": epoch,
             "args": vars(args),
@@ -242,24 +260,27 @@ def compute_losses(
     y = batch["y"].to(device, non_blocking=True)
     delta = batch["delta"].to(device, non_blocking=True)
     weight = batch["weight"].to(device, non_blocking=True)
+    # Source and target of a pair are the same patient in the same study, so a
+    # single per-row batch label applies to both sides.
+    batch_categories = batch.get("batch_category")
 
     freeze_autoencoder = bool(getattr(args, "stage1_vae_checkpoint", None)) or bool(
         getattr(args, "stage1_scvi_checkpoint", None)
     )
     if freeze_autoencoder:
         with torch.no_grad():
-            z_target = model.encode(y)
+            z_target = model.encode(y, batch_categories)
     else:
-        z_target = model.encode(y).detach()
+        z_target = model.encode(y, batch_categories).detach()
 
     if args.loss_mode == "cellflow":
         if args.level != 6:
             raise ValueError("--loss-mode cellflow is only intended for --level 6.")
         if freeze_autoencoder:
             with torch.no_grad():
-                z_source = model.encode(x)
+                z_source = model.encode(x, batch_categories)
         else:
-            z_source = model.encode(x)
+            z_source = model.encode(x, batch_categories)
         z_pred = model.integrate_cellflow(
             z_source,
             delta,
@@ -274,7 +295,7 @@ def compute_losses(
             "residual": z_pred - z_source,
         }
     else:
-        out = model(x, delta)
+        out = model(x, delta, batch_categories)
 
     metric_parts = chreode_population_loss(out, z_target, weight, chreode_config)
 
@@ -331,7 +352,7 @@ def compute_losses(
     if args.source_recon_loss_weight > 0:
         if freeze_autoencoder:
             raise ValueError("Source reconstruction loss is incompatible with a frozen Stage-1 VAE")
-        x_recon = model.decode(out["z_source"])
+        x_recon = model.decode(out["z_source"], batch_categories)
         loss_source_recon = weighted_mse(x_recon, x, weight)
         loss = loss + args.source_recon_loss_weight * loss_source_recon
 
@@ -339,7 +360,7 @@ def compute_losses(
         if freeze_autoencoder:
             raise ValueError("Expression loss is incompatible with a frozen Stage-1 VAE")
         if out["y_pred"] is None:
-            out["y_pred"] = model.decode(out["z_pred"])
+            out["y_pred"] = model.decode(out["z_pred"], batch_categories)
         loss_expr = weighted_mse(out["y_pred"], y, weight)
         loss = loss + args.expression_loss_weight * loss_expr
 
@@ -404,6 +425,27 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
 
+    # Take the batch key and technology filter from the Stage-1 checkpoint
+    # rather than from separate flags, so Stage 2 cannot silently train on a
+    # different cell population -- or with different batch labels -- than the
+    # frozen encoder was fitted on.
+    stage1_batch_key = None
+    stage1_keep_technologies = None
+    if args.stage1_scvi_checkpoint is not None:
+        from scvi_stage1_representation import peek_checkpoint_metadata
+
+        stage1_meta = peek_checkpoint_metadata(args.stage1_scvi_checkpoint)
+        stage1_batch_key = stage1_meta["batch_key"]
+        stage1_keep_technologies = stage1_meta["keep_technologies"]
+        print("stage1_batch_key:", stage1_batch_key)
+        print("stage1_keep_technologies:", stage1_keep_technologies)
+        needs_lookup = stage1_keep_technologies is not None or stage1_batch_key == "technology"
+        if needs_lookup and args.technology_lookup is None:
+            raise ValueError(
+                "The Stage-1 checkpoint was trained with a technology filter or "
+                "--batch-key technology; pass the same --technology-lookup to Stage 2."
+            )
+
     common_loader_kwargs = dict(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -416,6 +458,9 @@ def main() -> None:
         group_column=args.group_column,
         num_workers=args.num_workers,
         seed=args.seed,
+        batch_key=stage1_batch_key,
+        technology_lookup_path=args.technology_lookup,
+        keep_technologies=stage1_keep_technologies,
     )
 
     train_dataset, train_loader = build_paired_h5ad_loader(
@@ -487,10 +532,27 @@ def main() -> None:
         model.autoencoder.requires_grad_(False)
         model.autoencoder.eval()
 
+    # Level 0 is the non-learned identity baseline: it has no transition
+    # parameters by construction, so there is nothing to optimize. It runs a
+    # single evaluation pass to produce comparable metrics.
+    is_identity_baseline = args.level == 0
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable_parameters:
+    if not trainable_parameters and not is_identity_baseline:
         raise ValueError("No trainable Stage-2 parameters")
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+    if is_identity_baseline:
+        if trainable_parameters:
+            raise ValueError(
+                "Level 0 must have no trainable parameters. Freeze the representation "
+                "with --stage1-scvi-checkpoint or --stage1-vae-checkpoint."
+            )
+        if args.epochs != 1:
+            print(f"level 0: forcing --epochs 1 (was {args.epochs}); nothing is trained")
+            args.epochs = 1
+    optimizer = (
+        None
+        if is_identity_baseline
+        else torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+    )
     chreode_config = ChreodeLossConfig(
         lambda_mmd=args.lambda_mmd,
         lambda_w2=args.lambda_w2,
@@ -537,18 +599,24 @@ def main() -> None:
 
     for epoch in range(args.epochs):
         model.train()
+        if is_identity_baseline:
+            model.eval()
         if args.stage1_vae_checkpoint is not None:
             model.autoencoder.eval()
         train_stats = empty_stats()
 
         for batch in train_loader:
-            losses = compute_losses(model, batch, device, args, chreode_config)
+            if is_identity_baseline:
+                with torch.no_grad():
+                    losses = compute_losses(model, batch, device, args, chreode_config)
+            else:
+                losses = compute_losses(model, batch, device, args, chreode_config)
 
-            optimizer.zero_grad(set_to_none=True)
-            losses["loss"].backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_parameters, args.grad_clip)
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                losses["loss"].backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_parameters, args.grad_clip)
+                optimizer.step()
 
             add_stats(train_stats, losses)
             append_csv(

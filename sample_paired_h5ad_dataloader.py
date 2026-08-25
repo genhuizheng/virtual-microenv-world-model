@@ -50,11 +50,12 @@ Then later compare:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import argparse
 import math
 import random
+import re
 
 import numpy as np
 import pandas as pd
@@ -130,6 +131,79 @@ def compute_group_to_fold(
     if not group_to_fold:
         raise ValueError(f"No groups found for column {group_column!r}")
     return group_to_fold
+
+
+# =============================================================================
+# Batch / technology metadata
+# =============================================================================
+
+# Source-study accession embedded at the start of the patient directory name,
+# e.g. "E-MTAB-12733-Pt1" -> "E-MTAB-12733", "GSE246613-P3" -> "GSE246613".
+SOURCE_STUDY_PATTERN = re.compile(r"^([A-Z]-[A-Z]+-\d+|GSE\d+|SRP\d+|PRJ[A-Z]+\d+)")
+
+DEFAULT_KEEP_TECHNOLOGIES = ("10x genomics",)
+
+
+def derive_source_study(patient_id: str) -> str:
+    """
+    Extract the source-study accession from a patient identifier.
+
+    The scCT-DB-derived patient directory names embed the GEO/ArrayExpress
+    accession of the originating study. That accession is the correct
+    *technical* batch unit: one study means one lab, one protocol, and one
+    sequencing technology.
+
+    This is deliberately preferred over dataset_id as a batch key. An scCT-DB
+    dataset is partitioned by therapeutic regimen, cancer subtype, and drug
+    response group -- biological variables that must NOT be corrected away as
+    if they were technical batch. See docs/data_integration_decisions/README.md.
+
+    Falls back to the full patient_id when no accession prefix is present, so
+    the value is never empty.
+    """
+    text = str(patient_id).strip()
+    match = SOURCE_STUDY_PATTERN.match(text)
+    return match.group(1) if match else text
+
+
+def normalize_technology(value: str) -> str:
+    """
+    Case- and whitespace-normalize a sequencing technology label.
+
+    Required: the source metadata contains both "10X Genomics" and
+    "10x Genomics" for the same platform. Without normalization these become
+    two distinct batch categories and a model would try to correct a
+    difference that does not exist.
+    """
+    return " ".join(str(value).strip().lower().split())
+
+
+def load_technology_lookup(path: str | Path) -> Dict[str, str]:
+    """
+    Load a dataset_id -> normalized technology map.
+
+    Expects a TSV with `dataset_id` and `technology` columns, as produced by
+    scanning `uns["metadata"]` of the per-patient/dataset h5ads (the original
+    Sample_info tables are no longer present on disk).
+    """
+    table = pd.read_csv(path, sep="\t", dtype=str)
+    for column in ("dataset_id", "technology"):
+        if column not in table.columns:
+            raise ValueError(f"technology lookup {path} is missing column {column!r}")
+    lookup: Dict[str, str] = {}
+    for dataset_id, technology in zip(table["dataset_id"], table["technology"]):
+        key = str(dataset_id).strip()
+        value = normalize_technology(technology)
+        previous = lookup.get(key)
+        if previous is not None and previous != value:
+            raise ValueError(
+                f"dataset_id {key!r} maps to multiple technologies "
+                f"({previous!r} and {value!r}); the lookup must be unambiguous."
+            )
+        lookup[key] = value
+    if not lookup:
+        raise ValueError(f"technology lookup {path} produced no entries")
+    return lookup
 
 
 def safe_get_gene_symbols(var: pd.DataFrame, gene_ids: List[str]) -> List[str]:
@@ -218,6 +292,28 @@ class PairedH5ADBatchDataset(IterableDataset):
         Number of shard-level folds. Use 1 to disable folding.
     fold_index:
         Validation fold index in [0, num_folds).
+    batch_key:
+        Optional per-cell technical-batch label emitted as batch["batch_category"],
+        for use as a conditioning covariate (e.g. a frozen scVI encoder trained
+        with a batch key). One of:
+            "source_study"  derived from patient_id via derive_source_study()
+                            -- the recommended technical batch unit
+            "technology"    normalized sequencing technology (requires
+                            technology_lookup_path)
+            "dataset_id"    NOT recommended: scCT-DB datasets are partitioned by
+                            therapeutic regimen, cancer subtype, and drug
+                            response group, so conditioning on it removes
+                            biological signal
+            "patient_id"    raw patient identifier
+        None disables emission.
+    technology_lookup_path:
+        Optional TSV mapping dataset_id -> technology, as produced by scanning
+        uns["metadata"] of the per-patient/dataset h5ads. Required for
+        keep_technologies and for batch_key="technology".
+    keep_technologies:
+        Optional iterable of normalized technology names to retain; rows whose
+        technology is not listed are dropped at load time. Defaults to None
+        (keep everything). Pass DEFAULT_KEEP_TECHNOLOGIES to keep only 10x.
     """
 
     def __init__(
@@ -239,6 +335,9 @@ class PairedH5ADBatchDataset(IterableDataset):
         fold_index: int = 0,
         group_column: Optional[str] = None,
         seed: int = 42,
+        batch_key: Optional[str] = None,
+        technology_lookup_path: Optional[str | Path] = None,
+        keep_technologies: Optional[Iterable[str]] = None,
     ):
         super().__init__()
 
@@ -259,9 +358,29 @@ class PairedH5ADBatchDataset(IterableDataset):
         self.fold_index = int(fold_index)
         self.group_column = group_column
         self.seed = int(seed)
+        self.batch_key = batch_key
 
         if self.expression_transform not in {"none", "log1p_10k"}:
             raise ValueError("expression_transform must be one of {'none', 'log1p_10k'}")
+
+        valid_batch_keys = {None, "source_study", "technology", "dataset_id", "patient_id"}
+        if self.batch_key not in valid_batch_keys:
+            raise ValueError(f"batch_key must be one of {valid_batch_keys}, got {self.batch_key!r}")
+
+        self.keep_technologies = (
+            None
+            if keep_technologies is None
+            else {normalize_technology(t) for t in keep_technologies}
+        )
+        self.technology_lookup: Optional[Dict[str, str]] = None
+        if technology_lookup_path is not None:
+            self.technology_lookup = load_technology_lookup(technology_lookup_path)
+        needs_lookup = self.keep_technologies is not None or self.batch_key == "technology"
+        if needs_lookup and self.technology_lookup is None:
+            raise ValueError(
+                "technology_lookup_path is required when keep_technologies is set "
+                "or batch_key='technology'."
+            )
 
         self.manifest_path = self.data_dir / "paired_h5ad_manifest.tsv"
         if not self.manifest_path.exists():
@@ -351,6 +470,41 @@ class PairedH5ADBatchDataset(IterableDataset):
             rng.shuffle(indices)
         return indices
 
+    def _row_technologies(self, obs: pd.DataFrame) -> np.ndarray:
+        """Normalized technology per row, via the dataset_id lookup."""
+        if self.technology_lookup is None:
+            raise ValueError("technology lookup is not loaded")
+        if "dataset_id" not in obs.columns:
+            raise ValueError("shard obs has no dataset_id column; cannot resolve technology")
+        return (
+            obs["dataset_id"]
+            .astype(str)
+            .map(lambda d: self.technology_lookup.get(d.strip(), ""))
+            .to_numpy()
+        )
+
+    def _technology_keep_mask(self, obs: pd.DataFrame) -> np.ndarray:
+        """Boolean mask of rows whose technology is in keep_technologies."""
+        technologies = self._row_technologies(obs)
+        unknown = technologies == ""
+        if unknown.any():
+            missing = sorted(set(obs.loc[unknown, "dataset_id"].astype(str)))[:5]
+            raise ValueError(
+                f"{int(unknown.sum())} row(s) have a dataset_id absent from the "
+                f"technology lookup, e.g. {missing}. Filtering on incomplete "
+                "metadata would silently drop data."
+            )
+        return np.isin(technologies, list(self.keep_technologies))
+
+    def _batch_categories(self, obs_batch: pd.DataFrame) -> Optional[List[str]]:
+        if self.batch_key is None:
+            return None
+        if self.batch_key == "source_study":
+            return [derive_source_study(p) for p in obs_batch["patient_id"].astype(str)]
+        if self.batch_key == "technology":
+            return list(self._row_technologies(obs_batch))
+        return obs_batch[self.batch_key].astype(str).tolist()
+
     def _make_row_order(self, obs: pd.DataFrame, rng: np.random.Generator) -> np.ndarray:
         n = len(obs)
 
@@ -413,6 +567,8 @@ class PairedH5ADBatchDataset(IterableDataset):
             "target_cell": obs_batch["target_cell_original_obs"].astype(str).tolist() if "target_cell_original_obs" in obs_batch.columns else None,
         }
 
+        batch["batch_category"] = self._batch_categories(obs_batch)
+
         if self.include_gene_info_in_batch:
             batch["gene_ids"] = self.gene_ids
             batch["gene_symbols"] = self.gene_symbols
@@ -444,6 +600,18 @@ class PairedH5ADBatchDataset(IterableDataset):
                 raise ValueError(f"Missing probability column '{self.probability_col}' in shard: {shard_path}")
 
             obs = adata.obs.copy()
+
+            # Combine every row-level filter into one eligibility mask so that
+            # technology filtering and fold splitting compose correctly.
+            eligible_mask = np.ones(len(obs), dtype=bool)
+
+            if self.keep_technologies is not None:
+                try:
+                    eligible_mask &= self._technology_keep_mask(obs)
+                except ValueError:
+                    adata.file.close()
+                    raise
+
             if self.group_to_fold:
                 if self.group_column not in obs.columns:
                     adata.file.close()
@@ -452,18 +620,22 @@ class PairedH5ADBatchDataset(IterableDataset):
                 if folds.isna().any():
                     adata.file.close()
                     raise ValueError(f"Unassigned groups in {shard_path}")
-                eligible = np.flatnonzero(
-                    (folds.to_numpy() != self.fold_index)
+                fold_values = folds.to_numpy()
+                eligible_mask &= (
+                    (fold_values != self.fold_index)
                     if self.split == "train"
-                    else (folds.to_numpy() == self.fold_index)
+                    else (fold_values == self.fold_index)
                 )
+
+            if eligible_mask.all():
+                order = self._make_row_order(obs, rng)
+            else:
+                eligible = np.flatnonzero(eligible_mask)
                 if len(eligible) == 0:
                     adata.file.close()
                     continue
                 local_order = self._make_row_order(obs.iloc[eligible], rng)
                 order = eligible[local_order]
-            else:
-                order = self._make_row_order(obs, rng)
 
             for start in range(0, len(order), self.batch_size):
                 end = min(start + self.batch_size, len(order))
@@ -494,6 +666,9 @@ def build_paired_h5ad_loader(
     group_column: Optional[str] = None,
     num_workers: int = 0,
     seed: int = 42,
+    batch_key: Optional[str] = None,
+    technology_lookup_path: Optional[str | Path] = None,
+    keep_technologies: Optional[Iterable[str]] = None,
 ) -> Tuple[PairedH5ADBatchDataset, DataLoader]:
     """
     Build dataset and DataLoader.
@@ -516,6 +691,9 @@ def build_paired_h5ad_loader(
         group_column=group_column,
         include_gene_info_in_batch=include_gene_info_in_batch,
         seed=seed,
+        batch_key=batch_key,
+        technology_lookup_path=technology_lookup_path,
+        keep_technologies=keep_technologies,
     )
 
     loader = DataLoader(

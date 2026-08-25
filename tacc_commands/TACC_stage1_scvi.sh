@@ -20,10 +20,13 @@
 source /home1/10119/ghzheng/.bashrc
 conda activate worldmodeltraining
 
-# Locate the repo root relative to this script's own path, not a hardcoded
-# directory -- this script must work regardless of which clone (e.g.
-# Virtual_microenv vs Virtual_microenv_v2) it's run from.
-cd "$(dirname "$(readlink -f "$0")")/.."
+# Locate the repo root without a hardcoded path. Under `sbatch`, SLURM copies
+# this script into a per-job spool directory before running it, so $0 no
+# longer points at its real location -- SLURM_SUBMIT_DIR (the directory
+# `sbatch` was invoked from) is the reliable way to get back to the repo
+# root there. Direct `bash tacc_commands/TACC_stage1_scvi.sh ...` runs don't
+# set SLURM_SUBMIT_DIR, so fall back to $0's own location in that case.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}"
 set -e
 
 MODE="${1:-full}"

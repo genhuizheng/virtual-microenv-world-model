@@ -38,7 +38,13 @@ import scipy.sparse as sp
 import anndata as ad
 import torch
 
-from sample_paired_h5ad_dataloader import compute_group_to_fold, safe_get_gene_symbols
+from sample_paired_h5ad_dataloader import (
+    compute_group_to_fold,
+    derive_source_study,
+    load_technology_lookup,
+    normalize_technology,
+    safe_get_gene_symbols,
+)
 from scvi_stage1_representation import CHECKPOINT_FORMAT
 
 
@@ -64,6 +70,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fold-index", type=int, default=0)
     p.add_argument("--group-column", type=str, default="patient_id")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--batch-key",
+        choices=["none", "source_study", "technology", "dataset_id", "patient_id"],
+        default="none",
+        help="Technical batch covariate for scVI. 'source_study' (the GEO/ArrayExpress "
+        "accession embedded in patient_id) is recommended: one study means one lab, one "
+        "protocol, one technology. Do NOT use 'dataset_id' -- scCT-DB datasets are "
+        "partitioned by therapeutic regimen, cancer subtype, and drug-response group, so "
+        "conditioning on it would remove the biology this project models.",
+    )
+    p.add_argument(
+        "--technology-lookup",
+        type=Path,
+        default=None,
+        help="TSV with dataset_id/technology columns. Required for --keep-technologies "
+        "and for --batch-key technology.",
+    )
+    p.add_argument(
+        "--keep-technologies",
+        type=str,
+        default=None,
+        help="Comma-separated technologies to retain (case-insensitive), e.g. "
+        "'10x genomics'. Rows from other technologies are dropped before training.",
+    )
     p.add_argument(
         "--max-cells",
         type=int,
@@ -130,14 +160,74 @@ def load_paired_shards_as_role_anndata(data_dir: Path) -> ad.AnnData:
     return combined
 
 
+def annotate_batch_metadata(
+    combined: ad.AnnData,
+    technology_lookup_path: Path | None,
+    keep_technologies: set[str] | None,
+) -> ad.AnnData:
+    """
+    Add `source_study` (and `technology`, when a lookup is given) to obs, then
+    optionally drop rows from unwanted technologies.
+
+    `source_study` is the GEO/ArrayExpress accession embedded in patient_id:
+    one study means one lab, one protocol, one sequencing technology, which is
+    the correct *technical* batch unit. dataset_id is deliberately not used for
+    this -- scCT-DB partitions datasets by therapeutic regimen, cancer subtype,
+    and drug-response group, all of which are biological.
+    """
+    if "patient_id" not in combined.obs.columns:
+        raise ValueError("pooled obs has no patient_id column; cannot derive source_study")
+    combined.obs["source_study"] = [
+        derive_source_study(p) for p in combined.obs["patient_id"].astype(str)
+    ]
+
+    if technology_lookup_path is not None:
+        lookup = load_technology_lookup(technology_lookup_path)
+        if "dataset_id" not in combined.obs.columns:
+            raise ValueError("pooled obs has no dataset_id column; cannot resolve technology")
+        technologies = (
+            combined.obs["dataset_id"].astype(str).map(lambda d: lookup.get(d.strip(), ""))
+        )
+        unknown = technologies == ""
+        if unknown.any():
+            missing = sorted(set(combined.obs.loc[unknown, "dataset_id"].astype(str)))[:5]
+            raise ValueError(
+                f"{int(unknown.sum())} cell(s) have a dataset_id absent from the technology "
+                f"lookup, e.g. {missing}. Refusing to proceed on incomplete metadata."
+            )
+        combined.obs["technology"] = technologies.to_numpy()
+
+        if keep_technologies is not None:
+            keep_mask = combined.obs["technology"].isin(keep_technologies).to_numpy()
+            dropped = int((~keep_mask).sum())
+            kept_counts = combined.obs.loc[~keep_mask, "technology"].value_counts()
+            print(
+                f"technology filter: keeping {sorted(keep_technologies)} -> "
+                f"{int(keep_mask.sum())} cells kept, {dropped} dropped"
+            )
+            if dropped:
+                print("  dropped by technology:")
+                print("   ", kept_counts.to_dict())
+            if not keep_mask.any():
+                raise ValueError("technology filter removed every cell")
+            combined = combined[keep_mask].copy()
+    elif keep_technologies is not None:
+        raise ValueError("--keep-technologies requires --technology-lookup")
+
+    return combined
+
+
 def build_split_anndata(
     data_dir: Path,
     group_column: str,
     num_folds: int,
     fold_index: int,
     seed: int,
+    technology_lookup_path: Path | None = None,
+    keep_technologies: set[str] | None = None,
 ) -> tuple[ad.AnnData, ad.AnnData]:
     combined = load_paired_shards_as_role_anndata(data_dir)
+    combined = annotate_batch_metadata(combined, technology_lookup_path, keep_technologies)
     if num_folds <= 1:
         return combined, combined[:0].copy()
 
@@ -182,8 +272,32 @@ def main() -> None:
     print("scvi version:", scvi.__version__)
     print("torch version:", torch.__version__)
 
+    keep_technologies = None
+    if args.keep_technologies:
+        keep_technologies = {
+            normalize_technology(t) for t in args.keep_technologies.split(",") if t.strip()
+        }
+        if not keep_technologies:
+            raise ValueError("--keep-technologies was given but parsed to an empty set")
+
+    batch_key = None if args.batch_key == "none" else args.batch_key
+    if batch_key == "technology" and args.technology_lookup is None:
+        raise ValueError("--batch-key technology requires --technology-lookup")
+    if batch_key == "dataset_id":
+        print(
+            "WARNING: --batch-key dataset_id conditions on a variable partitioned by "
+            "therapeutic regimen, cancer subtype, and drug-response group. This removes "
+            "biological signal this project models. Prefer --batch-key source_study."
+        )
+
     train_adata, val_adata = build_split_anndata(
-        args.data_dir, args.group_column, args.num_folds, args.fold_index, args.seed
+        args.data_dir,
+        args.group_column,
+        args.num_folds,
+        args.fold_index,
+        args.seed,
+        technology_lookup_path=args.technology_lookup,
+        keep_technologies=keep_technologies,
     )
     train_adata = subsample(train_adata, args.max_cells, args.seed)
     val_adata = subsample(val_adata, args.max_cells, args.seed + 1)
@@ -196,7 +310,28 @@ def main() -> None:
     gene_ids = list(train_adata.var_names.astype(str))
     gene_symbols = safe_get_gene_symbols(train_adata.var, gene_ids)
 
-    scvi.model.SCVI.setup_anndata(train_adata)
+    if batch_key is not None:
+        n_categories = train_adata.obs[batch_key].nunique()
+        print(f"batch_key={batch_key}  ({n_categories} categories in train split)")
+        if n_categories < 2:
+            raise ValueError(
+                f"--batch-key {batch_key} has only {n_categories} category after "
+                "filtering; a single-category batch key corrects nothing. Either drop "
+                "--batch-key or choose a finer grouping (e.g. source_study)."
+            )
+        # Validation cells must belong to categories scVI has seen, otherwise
+        # get_reconstruction_error() cannot embed them.
+        unseen = set(val_adata.obs[batch_key].astype(str)) - set(
+            train_adata.obs[batch_key].astype(str)
+        )
+        if unseen:
+            print(
+                f"WARNING: {len(unseen)} {batch_key} value(s) appear only in validation "
+                f"and were never trained on, e.g. {sorted(unseen)[:5]}. Their "
+                "reconstruction error is not meaningful."
+            )
+
+    scvi.model.SCVI.setup_anndata(train_adata, batch_key=batch_key)
     use_gpu = args.device in ("auto", "cuda") and torch.cuda.is_available()
     accelerator = "gpu" if use_gpu else "cpu"
 
@@ -227,6 +362,23 @@ def main() -> None:
         print("num_folds=1: no held-out validation split (full-data training).")
 
     n_batch = int(model.summary_stats["n_batch"])
+
+    # Recover scVI's own category -> integer-index mapping so Stage 2 can encode
+    # a cell's batch label the same way training did. Reading it back from the
+    # fitted manager (rather than re-deriving it) guarantees the ordering matches.
+    if batch_key is None:
+        batch_category_to_index = None
+    else:
+        state = model.adata_manager.get_state_registry(scvi.REGISTRY_KEYS.BATCH_KEY)
+        categories = [str(c) for c in state["categorical_mapping"]]
+        batch_category_to_index = {c: i for i, c in enumerate(categories)}
+        if len(categories) != n_batch:
+            raise ValueError(
+                f"scVI reports n_batch={n_batch} but the categorical mapping has "
+                f"{len(categories)} entries; refusing to save an inconsistent checkpoint."
+            )
+        print(f"batch categories ({n_batch}): {categories[:8]}{' ...' if n_batch > 8 else ''}")
+
     module_init_kwargs = dict(
         n_input=train_adata.n_vars,
         n_batch=n_batch,
@@ -247,6 +399,9 @@ def main() -> None:
         "format": CHECKPOINT_FORMAT,
         "module_state_dict": model.module.state_dict(),
         "module_init_kwargs": module_init_kwargs,
+        "batch_key": batch_key,
+        "batch_category_to_index": batch_category_to_index,
+        "keep_technologies": sorted(keep_technologies) if keep_technologies else None,
         "reference_library_size": args.reference_library_size,
         "n_genes": train_adata.n_vars,
         "gene_ids": gene_ids,

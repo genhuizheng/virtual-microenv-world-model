@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import math
 
@@ -193,6 +193,13 @@ class LatentTokenizer(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         tokens = self.proj(z).view(z.shape[0], self.num_tokens, self.model_dim)
         return tokens + self.pos
+
+
+class IdentityResidual(nn.Module):
+    """Level 0: non-learned baseline. Predicts no change (z_pred = z_source)."""
+
+    def forward(self, z: torch.Tensor, delta: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"z_pred": z, "residual": torch.zeros_like(z)}
 
 
 class PlainTransformerResidual(nn.Module):
@@ -619,8 +626,8 @@ class FiveLevelCellWorldModel(nn.Module):
 
     def __init__(self, config: CellWorldModelConfig):
         super().__init__()
-        if config.level not in {1, 2, 3, 4, 5, 6}:
-            raise ValueError("level must be one of {1, 2, 3, 4, 5, 6}.")
+        if config.level not in {0, 1, 2, 3, 4, 5, 6}:
+            raise ValueError("level must be one of {0, 1, 2, 3, 4, 5, 6}.")
         if config.level != 5 and config.variant != "default":
             raise ValueError("--variant is only used for level 5; use --variant default for other levels.")
         self.config = config
@@ -666,7 +673,9 @@ class FiveLevelCellWorldModel(nn.Module):
             config.num_tokens,
             config.dropout,
         )
-        if config.level == 1:
+        if config.level == 0:
+            self.transition = IdentityResidual()
+        elif config.level == 1:
             self.transition = PlainTransformerResidual(*transition_args)
         elif config.level == 2:
             self.transition = DiTResidual(*transition_args)
@@ -692,12 +701,22 @@ class FiveLevelCellWorldModel(nn.Module):
         else:
             self.transition = CellFlowVelocityField(*transition_args)
 
-    def forward(self, x: torch.Tensor, delta: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    @property
+    def autoencoder_takes_batch(self) -> bool:
+        """True when the representation conditions on a technical batch label."""
+        return self.config.representation_type == "scvi"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        delta: Optional[torch.Tensor] = None,
+        batch_categories: Optional[Sequence[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
         if delta is None:
             delta = torch.ones(x.shape[0], device=x.device, dtype=x.dtype)
-        z_source = self.autoencoder.encode(x)
+        z_source = self.encode(x, batch_categories)
         transition_out = self.transition(z_source, delta)
-        y_pred = self.autoencoder.decode(transition_out["z_pred"])
+        y_pred = self.decode(transition_out["z_pred"], batch_categories)
         out = {
             "y_pred": y_pred,
             "z_source": z_source,
@@ -707,10 +726,20 @@ class FiveLevelCellWorldModel(nn.Module):
         out.update(transition_out)
         return out
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self, x: torch.Tensor, batch_categories: Optional[Sequence[str]] = None
+    ) -> torch.Tensor:
+        if self.autoencoder_takes_batch:
+            return self.autoencoder.encode(x, batch_categories)
         return self.autoencoder.encode(x)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self, z: torch.Tensor, batch_categories: Optional[Sequence[str]] = None
+    ) -> torch.Tensor:
+        # A predicted post-treatment latent has no observed batch of its own, so
+        # it is decoded into the same batch as the source cell it came from.
+        if self.autoencoder_takes_batch:
+            return self.autoencoder.decode(z, batch_categories)
         return self.autoencoder.decode(z)
 
     def predict_velocity(
