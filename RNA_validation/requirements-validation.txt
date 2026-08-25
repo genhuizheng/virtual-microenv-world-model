@@ -1,0 +1,11 @@
+numpy
+pandas
+scipy
+scikit-learn
+anndata
+torch
+lifelines
+ipython
+datasets>=2.3,<3
+# Install scGPT separately in the TACC environment for run_scgpt_benchmark.py.
+# Clone https://github.com/mims-harvard/COMPASS for empirical score implementations.

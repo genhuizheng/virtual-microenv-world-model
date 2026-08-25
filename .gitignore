@@ -1,0 +1,33 @@
+# Data and model artifacts (live on TACC /scratch, not in git)
+*.h5ad
+paired_training_h5ad_*/
+checkpoints_*/
+stage1_*/
+smoke_level*/
+*.pt
+*.pth
+
+# Local result/analysis outputs
+result/
+*.zip
+*.tar
+*.tar.gz
+*.tar.gz.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+venv/
+.venv/
+env/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Slurm job output
+*.out
+*.err
