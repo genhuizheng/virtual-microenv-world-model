@@ -1,0 +1,21 @@
+tag	gene_likelihood	expression_transform	latent_dim	n_hidden	n_layers	dispersion	batch_key	gene_list	note
+p90_bat_zinb	zinb	none	128	512	2	gene	source_study	90pct	panel 15k | batch | counts+ZINB
+p90_bat_nb	nb	none	128	512	2	gene	source_study	90pct	panel 15k | batch | counts+NB
+p90_bat_poisson	poisson	none	128	512	2	gene	source_study	90pct	panel 15k | batch | counts+Poisson
+p90_bat_log1p	normal	log1p_10k	128	512	2	gene	source_study	90pct	panel 15k | batch | log1p+Normal
+p90_bat_bin51	normal	bin_51	128	512	2	gene	source_study	90pct	panel 15k | batch | scGPT bins+Normal
+p90_nob_zinb	zinb	none	128	512	2	gene	none	90pct	panel 15k | no batch | counts+ZINB
+p90_nob_nb	nb	none	128	512	2	gene	none	90pct	panel 15k | no batch | counts+NB
+p90_nob_poisson	poisson	none	128	512	2	gene	none	90pct	panel 15k | no batch | counts+Poisson
+p90_nob_log1p	normal	log1p_10k	128	512	2	gene	none	90pct	panel 15k | no batch | log1p+Normal
+p90_nob_bin51	normal	bin_51	128	512	2	gene	none	90pct	panel 15k | no batch | scGPT bins+Normal
+p50_bat_zinb	zinb	none	128	512	2	gene	source_study	50pct	panel 26k | batch | counts+ZINB
+p50_bat_nb	nb	none	128	512	2	gene	source_study	50pct	panel 26k | batch | counts+NB
+p50_bat_poisson	poisson	none	128	512	2	gene	source_study	50pct	panel 26k | batch | counts+Poisson
+p50_bat_log1p	normal	log1p_10k	128	512	2	gene	source_study	50pct	panel 26k | batch | log1p+Normal
+p50_bat_bin51	normal	bin_51	128	512	2	gene	source_study	50pct	panel 26k | batch | scGPT bins+Normal
+p50_nob_zinb	zinb	none	128	512	2	gene	none	50pct	panel 26k | no batch | counts+ZINB
+p50_nob_nb	nb	none	128	512	2	gene	none	50pct	panel 26k | no batch | counts+NB
+p50_nob_poisson	poisson	none	128	512	2	gene	none	50pct	panel 26k | no batch | counts+Poisson
+p50_nob_log1p	normal	log1p_10k	128	512	2	gene	none	50pct	panel 26k | no batch | log1p+Normal
+p50_nob_bin51	normal	bin_51	128	512	2	gene	none	50pct	panel 26k | no batch | scGPT bins+Normal

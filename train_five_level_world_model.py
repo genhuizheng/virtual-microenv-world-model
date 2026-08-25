@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-time-delta", type=float, default=1.0)
     parser.add_argument(
         "--expression-transform",
-        choices=["none", "log1p_10k"],
+        type=str,
         default=None,
         help="Defaults to 'none', except with --stage1-scvi-checkpoint, where it is "
         "adopted from the checkpoint so the frozen encoder always receives the units it "

@@ -15,10 +15,16 @@ comparison is actually meaningful.
 
 Three questions, which is what a batch-conditioned VAE has to get right:
 
-1. Reconstruction. encode() then decode() and compare against the true log1p
-   expression. `ScVIExpressionAutoencoder.decode()` returns log1p-scale output
-   for every likelihood by construction, so this metric is identical in
-   meaning across configs.
+1. Reconstruction. encode() then decode(), compared against the target in
+   whatever units decode() returns: log1p for count likelihoods, and the
+   encoder's own input units for the Normal likelihood (log1p_10k, or bin
+   indices under a bin_<N> transform).
+
+   This means MSE is only comparable BETWEEN CONFIGURATIONS THAT SHARE UNITS --
+   a bin-space MSE and a log1p MSE are different quantities. The per-cell
+   Pearson correlation is the cross-configuration metric, since correlation is
+   invariant to the scale of either side; it asks whether the model ranks a
+   cell's genes correctly, which means the same thing in any units.
 
 2. Batch mixing. For each cell, what fraction of its k nearest latent
    neighbours come from the same source study? If the batch key worked, this
@@ -52,8 +58,38 @@ import numpy as np
 import torch
 
 from sample_paired_h5ad_dataloader import derive_source_study
-from scvi_stage1_representation import ScVIExpressionAutoencoder, peek_checkpoint_metadata
+from scvi_stage1_representation import (
+    CHECKPOINT_FORMAT as SCVI_FORMAT,
+    ScVIExpressionAutoencoder,
+    peek_checkpoint_metadata,
+)
 from train_stage1_scvi import build_split_anndata
+
+
+def load_stage1(checkpoint: Path):
+    """
+    Load either Stage-1 representation and return (model, metadata).
+
+    Both expose the same encode(x, batch_categories) / decode(z, batch_categories)
+    contract, so everything downstream is format-agnostic. Dispatch is on the
+    checkpoint's own `format` field rather than on a flag, so the two cannot be
+    confused.
+    """
+    payload_format = torch.load(checkpoint, map_location="cpu", weights_only=False).get("format")
+    if payload_format == SCVI_FORMAT:
+        meta = peek_checkpoint_metadata(checkpoint)
+        return ScVIExpressionAutoencoder.from_checkpoint(checkpoint), meta
+
+    from masked_vae import CHECKPOINT_FORMAT as MASKED_FORMAT, MaskedVAERepresentation
+
+    if payload_format == MASKED_FORMAT:
+        model = MaskedVAERepresentation.from_checkpoint(checkpoint)
+        meta = dict(model.checkpoint_metadata)
+        meta.setdefault("gene_likelihood", "masked_gaussian")
+        meta["batch_category_to_index"] = model.batch_category_to_index
+        return model, meta
+
+    raise ValueError(f"Unrecognised Stage-1 checkpoint format: {payload_format!r}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +106,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20000,
         help="Subsample the held-out split before the O(n^2)-ish kNN step.",
+    )
+    p.add_argument(
+        "--gene-mask-npz",
+        type=Path,
+        default=None,
+        help="Optional dataset gene-mask npz. When given, reconstruction is scored ONLY "
+        "over genes each cell's dataset actually measured. Strongly recommended: a "
+        "structural zero is not a real target, so scoring against it measures agreement "
+        "with padding. Applies to every configuration equally, so comparability is kept "
+        "and a masked-reconstruction model is not penalised on genes it never modelled.",
     )
     p.add_argument("--n-neighbors", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=512)
@@ -115,11 +161,13 @@ def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
 
-    meta = peek_checkpoint_metadata(args.checkpoint)
-    keep_technologies = set(meta["keep_technologies"]) if meta["keep_technologies"] else None
+    model, meta = load_stage1(args.checkpoint)
+    model = model.to(device)
+    model.eval()
+    keep_technologies = set(meta["keep_technologies"]) if meta.get("keep_technologies") else None
     print("checkpoint:", args.checkpoint)
-    print("  gene_likelihood     :", meta["gene_likelihood"])
-    print("  expression_transform:", meta["expression_transform"])
+    print("  gene_likelihood     :", meta.get("gene_likelihood", "?"))
+    print("  expression_transform:", meta.get("expression_transform", "none"))
     print("  batch_key           :", meta["batch_key"])
     print("  keep_technologies   :", meta["keep_technologies"])
 
@@ -137,7 +185,7 @@ def main() -> None:
         args.seed,
         technology_lookup_path=args.technology_lookup,
         keep_technologies=keep_technologies,
-        expression_transform=meta["expression_transform"],
+        expression_transform=meta.get("expression_transform", "none"),
         keep_gene_ids=list(meta["gene_ids"]),
     )
     if val_adata.n_vars != meta["n_genes"]:
@@ -166,21 +214,44 @@ def main() -> None:
         val_adata = val_adata[idx].copy()
     print(f"  evaluating on {val_adata.n_obs} held-out cells")
 
-    model = ScVIExpressionAutoencoder.from_checkpoint(args.checkpoint).to(device)
-    model.eval()
-
     batch_categories_all = (
         val_adata.obs[meta["batch_key"]].astype(str).tolist() if meta["batch_key"] else None
     )
 
-    # The reconstruction target is always log1p-scale, matching decode()'s
-    # contract, regardless of which units the encoder consumes.
+    # The reconstruction target must be in whatever units decode() returns,
+    # which depends on the likelihood:
+    #   count likelihoods -> log1p(px_scale * reference_library), so the target
+    #                        is log1p even though the encoder consumed counts
+    #   normal likelihood -> px.loc, i.e. the same units the encoder consumed
+    #                        (log1p_10k, or bin indices for a bin_<N> transform)
+    # Getting this wrong silently scores predictions against the wrong scale --
+    # comparing bin-space output to a log1p target, for instance.
     from sample_paired_h5ad_dataloader import transform_expression_sparse
 
-    if meta["expression_transform"] == "log1p_10k":
-        target_matrix = val_adata.X  # already log1p
-    else:
+    if meta.get("expression_transform", "none") == "none":
         target_matrix = transform_expression_sparse(val_adata.X, "log1p_10k")
+        recon_units = "log1p_10k"
+    else:
+        target_matrix = val_adata.X
+        recon_units = meta.get("expression_transform", "none")
+    print("  reconstruction units:", recon_units)
+
+    # Optional per-cell measured-gene mask. Scoring reconstruction against a
+    # structural zero measures agreement with padding, not with biology, so
+    # when a mask is available every configuration is scored only where there
+    # is a real observation.
+    gene_mask_rows = None
+    if args.gene_mask_npz is not None:
+        from train_stage1_masked_vae import build_mask_matrix, load_gene_masks
+
+        mask_index, mask_matrix = load_gene_masks(args.gene_mask_npz, list(meta["gene_ids"]))
+        gene_mask_rows = build_mask_matrix(
+            val_adata.obs["dataset_id"].to_numpy(), mask_index, mask_matrix
+        )
+        print(
+            f"  scoring reconstruction over measured genes only "
+            f"(mean {gene_mask_rows.mean():.3f} of the panel per cell)"
+        )
 
     latents, cell_pearson, squared_error, n_values = [], [], 0.0, 0
     with torch.no_grad():
@@ -197,11 +268,21 @@ def main() -> None:
             target = torch.as_tensor(
                 np.asarray(target_matrix[start:end].todense(), dtype=np.float32), device=device
             )
-            squared_error += float(((y - target) ** 2).sum())
-            n_values += target.numel()
+            if gene_mask_rows is None:
+                mask = torch.ones_like(target)
+            else:
+                mask = torch.as_tensor(
+                    gene_mask_rows[start:end].astype(np.float32), device=device
+                )
 
-            yc = y - y.mean(dim=1, keepdim=True)
-            tc = target - target.mean(dim=1, keepdim=True)
+            squared_error += float((((y - target) ** 2) * mask).sum())
+            n_values += float(mask.sum())
+
+            # Center and correlate over the masked entries only, so unmeasured
+            # genes influence neither the means nor the correlation.
+            counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            yc = (y - (y * mask).sum(dim=1, keepdim=True) / counts) * mask
+            tc = (target - (target * mask).sum(dim=1, keepdim=True) / counts) * mask
             denom = yc.norm(dim=1) * tc.norm(dim=1)
             r = torch.where(denom > 0, (yc * tc).sum(dim=1) / denom.clamp(min=1e-8),
                             torch.zeros_like(denom))
@@ -213,10 +294,10 @@ def main() -> None:
 
     print()
     print("=" * 64)
-    print("RECONSTRUCTION (log1p units -- comparable across configurations)")
+    print(f"RECONSTRUCTION (units: {recon_units})")
     print("=" * 64)
-    print(f"  MSE                      : {recon_mse:.6f}")
-    print(f"  per-cell Pearson r  mean : {float(pearson.mean()):.4f}")
+    print(f"  MSE                      : {recon_mse:.6f}   <- only comparable within the same units")
+    print(f"  per-cell Pearson r  mean : {float(pearson.mean()):.4f}   <- comparable across all configs")
     print(f"                    median : {float(np.median(pearson)):.4f}")
 
     source_study = np.array(
@@ -248,11 +329,13 @@ def main() -> None:
 
     result = {
         "checkpoint": str(args.checkpoint),
-        "gene_likelihood": meta["gene_likelihood"],
-        "expression_transform": meta["expression_transform"],
+        "gene_likelihood": meta.get("gene_likelihood", "?"),
+        "expression_transform": meta.get("expression_transform", "none"),
         "batch_key": meta["batch_key"],
         "n_cells": int(val_adata.n_obs),
-        "recon_mse_log1p": recon_mse,
+        "recon_units": recon_units,
+        "recon_mse": recon_mse,
+        "recon_mse_log1p": recon_mse if recon_units == "log1p_10k" else None,
         "recon_pearson_mean": float(pearson.mean()),
         "recon_pearson_median": float(np.median(pearson)),
         "knn_same_source_study": study_same,

@@ -43,6 +43,7 @@ from sample_paired_h5ad_dataloader import (
     derive_source_study,
     load_technology_lookup,
     normalize_technology,
+    parse_bin_transform,
     safe_get_gene_symbols,
     transform_expression_sparse,
 )
@@ -78,12 +79,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--expression-transform",
-        choices=["none", "log1p_10k"],
+        type=str,
         default="none",
-        help="'none' keeps raw counts (required for count likelihoods; scVI applies its "
-        "own internal log1p before the encoder and models library size explicitly). "
-        "'log1p_10k' applies normalize_total(1e4)+log1p and is required for "
-        "--gene-likelihood normal.",
+        help="One of: 'none' (raw counts; required for count likelihoods -- scVI applies "
+        "its own internal log1p before the encoder and models library size explicitly), "
+        "'log1p_10k' (normalize_total(1e4)+log1p), or 'bin_<N>' e.g. 'bin_51' "
+        "(scGPT-style per-cell rank binning into N equal-count bins). Both log1p_10k and "
+        "bin_<N> require --gene-likelihood normal, since neither produces counts.",
     )
     p.add_argument("--reference-library-size", type=float, default=1e4)
     p.add_argument("--num-folds", type=int, default=5)
@@ -369,16 +371,33 @@ def main() -> None:
     # does not validate this, so a mismatch would train "successfully" while
     # modelling the wrong thing.
     count_likelihoods = {"zinb", "nb", "poisson"}
+    is_binned = parse_bin_transform(args.expression_transform) is not None
+    if args.expression_transform not in {"none", "log1p_10k"} and not is_binned:
+        raise ValueError(
+            f"Unknown --expression-transform {args.expression_transform!r}; expected "
+            "'none', 'log1p_10k', or 'bin_<N>'."
+        )
     if args.gene_likelihood in count_likelihoods and args.expression_transform != "none":
         raise ValueError(
             f"--gene-likelihood {args.gene_likelihood} is a count distribution and requires "
             "--expression-transform none (raw counts). scVI applies its own log1p before "
             "the encoder and models library size explicitly."
         )
-    if args.gene_likelihood == "normal" and args.expression_transform != "log1p_10k":
+    if args.gene_likelihood == "normal" and args.expression_transform == "none":
         raise ValueError(
-            "--gene-likelihood normal requires --expression-transform log1p_10k. "
-            "A Normal likelihood on raw counts models the wrong scale."
+            "--gene-likelihood normal requires --expression-transform log1p_10k or "
+            "bin_<N>. A Normal likelihood on raw counts models the wrong scale."
+        )
+    if is_binned:
+        # Bin indices are ranks, not abundances: they have no library size, and
+        # scVI's decoder still applies library scaling. mean_log_library (used
+        # for the Normal decode path) therefore ends up standing in for "typical
+        # total bin mass per cell". It is well-defined and the evaluator scores
+        # it fairly, but if binning wins decisively it deserves a proper
+        # implementation outside scVI rather than this accommodation.
+        print(
+            f"NOTE: {args.expression_transform} feeds rank bins to scVI, whose decoder "
+            "assumes library-scaled abundances. See train_stage1_scvi.py for why."
         )
 
     keep_technologies = None

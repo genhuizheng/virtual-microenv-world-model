@@ -79,6 +79,57 @@ def to_dense_numpy(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+BIN_TRANSFORM_PREFIX = "bin_"
+
+
+def parse_bin_transform(transform: str) -> Optional[int]:
+    """Return the bin count for a 'bin_<N>' transform, else None."""
+    if not transform.startswith(BIN_TRANSFORM_PREFIX):
+        return None
+    suffix = transform[len(BIN_TRANSFORM_PREFIX):]
+    if not suffix.isdigit():
+        raise ValueError(f"Malformed bin transform {transform!r}; expected e.g. 'bin_51'")
+    n_bins = int(suffix)
+    if n_bins < 2:
+        raise ValueError(f"bin transform needs at least 2 bins, got {n_bins}")
+    return n_bins
+
+
+def _bin_values(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """
+    Rank-bin one cell's NON-ZERO expression values into n_bins equal-count bins.
+
+    This is scGPT's value-binning idea: within a cell, sort the expressed genes
+    and split them into B intervals each holding 1/B of them, so a bin index
+    means "this gene is in the k-th fraction of what this cell expresses".
+    Because the bin edges are recomputed per cell, the same index carries the
+    same meaning across cells regardless of sequencing depth or protocol --
+    which is the property that makes it robust to the batch differences that
+    survive normalization.
+
+    Bins are numbered 1..n_bins; zeros stay 0 and are not ranked, so sparsity
+    is preserved exactly and "not expressed" stays distinguishable from
+    "expressed least".
+
+    Two consequences of equal-count binning worth knowing:
+    - Tied values are split across adjacent bins, because every bin must hold
+      the same share of expressed genes. Bins still respect value order (a
+      strictly larger value never lands in a lower bin), but equal values may
+      not land in the same bin. scGPT has the same property; it is inherent to
+      the scheme, not an artifact here.
+    - A cell expressing a single gene puts it in bin 1. With one value there is
+      no distribution to place it within, so the lowest bin is as defensible as
+      any; such cells would normally be removed by QC anyway.
+    """
+    n = values.shape[0]
+    if n == 0:
+        return values
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(n, dtype=np.int64)
+    ranks[order] = np.arange(n, dtype=np.int64)
+    return (ranks * n_bins // n + 1).astype(np.float32)
+
+
 def transform_expression_rows(x: np.ndarray, transform: str) -> np.ndarray:
     """
     Transform raw count rows without modifying the stored H5AD matrices.
@@ -96,6 +147,14 @@ def transform_expression_rows(x: np.ndarray, transform: str) -> np.ndarray:
         library_size = x.sum(axis=1, dtype=np.float64, keepdims=True)
         scale = 10_000.0 / np.maximum(library_size, 1.0)
         return np.log1p(x * scale).astype(np.float32)
+    n_bins = parse_bin_transform(transform)
+    if n_bins is not None:
+        out = np.zeros_like(x, dtype=np.float32)
+        for i in range(x.shape[0]):
+            nz = np.flatnonzero(x[i])
+            if nz.size:
+                out[i, nz] = _bin_values(x[i, nz], n_bins)
+        return out
     raise ValueError(f"Unknown expression transform: {transform}")
 
 
@@ -122,6 +181,15 @@ def transform_expression_sparse(matrix: sp.spmatrix, transform: str) -> sp.csr_m
         scaled = (sp.diags(scale) @ csr).tocsr()
         scaled.data = np.log1p(scaled.data)
         return scaled
+    n_bins = parse_bin_transform(transform)
+    if n_bins is not None:
+        binned = csr.copy()
+        indptr = binned.indptr
+        for i in range(binned.shape[0]):
+            start, end = indptr[i], indptr[i + 1]
+            if end > start:
+                binned.data[start:end] = _bin_values(binned.data[start:end], n_bins)
+        return binned
     raise ValueError(f"Unknown expression transform: {transform}")
 
 
@@ -396,8 +464,14 @@ class PairedH5ADBatchDataset(IterableDataset):
         self.seed = int(seed)
         self.batch_key = batch_key
 
-        if self.expression_transform not in {"none", "log1p_10k"}:
-            raise ValueError("expression_transform must be one of {'none', 'log1p_10k'}")
+        if (
+            self.expression_transform not in {"none", "log1p_10k"}
+            and parse_bin_transform(self.expression_transform) is None
+        ):
+            raise ValueError(
+                "expression_transform must be 'none', 'log1p_10k', or 'bin_<N>'; "
+                f"got {self.expression_transform!r}"
+            )
 
         valid_batch_keys = {None, "source_study", "technology", "dataset_id", "patient_id"}
         if self.batch_key not in valid_batch_keys:
