@@ -115,6 +115,28 @@ def parse_args() -> argparse.Namespace:
         "'10x genomics'. Rows from other technologies are dropped before training.",
     )
     p.add_argument(
+        "--keep-gene-list",
+        type=Path,
+        default=None,
+        help="File of gene ids to restrict the panel to, one per line (or a TSV with a "
+        "gene_id column). Applied before --min-cells-detected and before the expression "
+        "transform. Use this to replace the zero-filled union panel with genes that most "
+        "datasets actually measured -- structural zeros are a per-study fingerprint the "
+        "model would otherwise learn as biology.",
+    )
+    p.add_argument(
+        "--min-cells-detected",
+        type=int,
+        default=0,
+        help="Drop genes detected (nonzero) in fewer than this many TRAINING cells. "
+        "0 disables filtering. Use 1 to remove genes never observed in any cell: the "
+        "unified panel is a zero-filled union across studies, so a large share of its "
+        "columns are structural zeros. They carry no information, inflate the input "
+        "projection (which dominates the parameter count at 46k genes), and let a "
+        "Gaussian likelihood collapse its variance to zero on them. Computed on the "
+        "training split only, so it leaks nothing from held-out patients.",
+    )
+    p.add_argument(
         "--max-cells",
         type=int,
         default=-1,
@@ -246,28 +268,72 @@ def build_split_anndata(
     technology_lookup_path: Path | None = None,
     keep_technologies: set[str] | None = None,
     expression_transform: str = "none",
+    min_cells_detected: int = 0,
+    keep_gene_ids: list[str] | None = None,
 ) -> tuple[ad.AnnData, ad.AnnData]:
     combined = load_paired_shards_as_role_anndata(data_dir)
     combined = annotate_batch_metadata(combined, technology_lookup_path, keep_technologies)
+
+    if num_folds <= 1:
+        train_adata, val_adata = combined, combined[:0].copy()
+    else:
+        group_to_fold = compute_group_to_fold(data_dir, group_column, num_folds, seed)
+        if group_column not in combined.obs.columns:
+            raise ValueError(f"Missing group column {group_column!r} in shard obs")
+        folds = combined.obs[group_column].astype(str).map(group_to_fold)
+        if folds.isna().any():
+            raise ValueError(f"Unassigned groups for column {group_column!r}")
+        combined.obs["_fold"] = folds.astype(int)
+        train_adata = combined[combined.obs["_fold"] != fold_index].copy()
+        val_adata = combined[combined.obs["_fold"] == fold_index].copy()
+        if train_adata.n_obs == 0 or val_adata.n_obs == 0:
+            raise ValueError(f"Empty split for num_folds={num_folds}, fold_index={fold_index}")
+
+    # Panel restriction. This is a fixed, externally supplied list (e.g. genes
+    # measured by >=90% of source datasets), so unlike the detection filter it
+    # uses no information from the data at all and cannot leak.
+    if keep_gene_ids is not None:
+        wanted = [str(g) for g in keep_gene_ids]
+        available = set(train_adata.var_names.astype(str))
+        missing = [g for g in wanted if g not in available]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} gene(s) in --keep-gene-list are absent from the data, "
+                f"e.g. {missing[:5]}"
+            )
+        print(f"panel restriction: {len(wanted)}/{train_adata.n_vars} genes kept")
+        train_adata = train_adata[:, wanted].copy()
+        if val_adata.n_obs:
+            val_adata = val_adata[:, wanted].copy()
+        else:
+            val_adata = val_adata[:, wanted].copy()
+
+    # Gene filtering, computed on the TRAINING split only so that held-out
+    # patients contribute nothing to the choice of genes, and applied BEFORE
+    # the expression transform so normalize_total's library is the sum over the
+    # genes actually modelled. The Stage-2 dataloader subsets in the same order.
+    if min_cells_detected > 0:
+        train_counts = np.asarray((train_adata.X > 0).sum(axis=0)).ravel()
+        keep = train_counts >= min_cells_detected
+        n_dropped = int((~keep).sum())
+        never = int((train_counts == 0).sum())
+        print(
+            f"gene filter (>= {min_cells_detected} training cells): "
+            f"{int(keep.sum())}/{len(keep)} kept, {n_dropped} dropped "
+            f"({never} never detected)"
+        )
+        if not keep.any():
+            raise ValueError("Gene filter removed every gene")
+        train_adata = train_adata[:, keep].copy()
+        val_adata = val_adata[:, keep].copy() if val_adata.n_obs else val_adata[:, keep].copy()
+
     if expression_transform != "none":
-        print(f"applying expression transform {expression_transform!r} to pooled expression")
+        print(f"applying expression transform {expression_transform!r}")
     # Same function family the Stage-2 dataloader uses, so both stages feed the
     # frozen encoder identical units.
-    combined.X = transform_expression_sparse(combined.X, expression_transform)
-    if num_folds <= 1:
-        return combined, combined[:0].copy()
-
-    group_to_fold = compute_group_to_fold(data_dir, group_column, num_folds, seed)
-    if group_column not in combined.obs.columns:
-        raise ValueError(f"Missing group column {group_column!r} in shard obs")
-    folds = combined.obs[group_column].astype(str).map(group_to_fold)
-    if folds.isna().any():
-        raise ValueError(f"Unassigned groups for column {group_column!r}")
-    combined.obs["_fold"] = folds.astype(int)
-    train_adata = combined[combined.obs["_fold"] != fold_index].copy()
-    val_adata = combined[combined.obs["_fold"] == fold_index].copy()
-    if train_adata.n_obs == 0 or val_adata.n_obs == 0:
-        raise ValueError(f"Empty split for num_folds={num_folds}, fold_index={fold_index}")
+    train_adata.X = transform_expression_sparse(train_adata.X, expression_transform)
+    if val_adata.n_obs:
+        val_adata.X = transform_expression_sparse(val_adata.X, expression_transform)
     return train_adata, val_adata
 
 
@@ -333,6 +399,20 @@ def main() -> None:
             "biological signal this project models. Prefer --batch-key source_study."
         )
 
+    keep_gene_ids = None
+    if args.keep_gene_list is not None:
+        text = args.keep_gene_list.read_text(encoding="utf-8").splitlines()
+        rows = [line.strip() for line in text if line.strip()]
+        # tolerate a TSV with a gene_id header column
+        if rows and rows[0].lower().split("	")[0] in {"gene_id", "gene"}:
+            rows = rows[1:]
+        keep_gene_ids = [r.split("	")[0] for r in rows]
+        if not keep_gene_ids:
+            raise ValueError(f"--keep-gene-list {args.keep_gene_list} is empty")
+        if len(set(keep_gene_ids)) != len(keep_gene_ids):
+            raise ValueError("--keep-gene-list contains duplicate gene ids")
+        print(f"keep_gene_list: {len(keep_gene_ids)} genes from {args.keep_gene_list}")
+
     train_adata, val_adata = build_split_anndata(
         args.data_dir,
         args.group_column,
@@ -342,6 +422,8 @@ def main() -> None:
         technology_lookup_path=args.technology_lookup,
         keep_technologies=keep_technologies,
         expression_transform=args.expression_transform,
+        min_cells_detected=args.min_cells_detected,
+        keep_gene_ids=keep_gene_ids,
     )
     train_adata = subsample(train_adata, args.max_cells, args.seed)
     val_adata = subsample(val_adata, args.max_cells, args.seed + 1)
@@ -471,6 +553,7 @@ def main() -> None:
         # Stage 2 must feed the encoder the same units Stage 1 was trained on.
         "expression_transform": args.expression_transform,
         "gene_likelihood": args.gene_likelihood,
+        "min_cells_detected": args.min_cells_detected,
         # Mean log library size over the training cells. The count path decodes
         # against a fixed 1e4 reference (px_scale is library-independent), but
         # the Normal path's px.loc IS library-scaled (px = Normal(px_rate, ...)),

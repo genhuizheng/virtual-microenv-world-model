@@ -373,6 +373,7 @@ class PairedH5ADBatchDataset(IterableDataset):
         technology_lookup_path: Optional[str | Path] = None,
         keep_technologies: Optional[Iterable[str]] = None,
         allowed_batch_categories: Optional[Iterable[str]] = None,
+        keep_gene_ids: Optional[Iterable[str]] = None,
     ):
         super().__init__()
 
@@ -486,8 +487,29 @@ class PairedH5ADBatchDataset(IterableDataset):
         self.gene_var = first.var.copy()
         self.gene_ids = list(first.var_names.astype(str))
         self.gene_symbols = safe_get_gene_symbols(self.gene_var, self.gene_ids)
-        self.n_genes = len(self.gene_ids)
         first.file.close()
+
+        # Optional gene subset. Applied as a column selection at read time, so
+        # the shards on disk keep the full unified panel and different gene
+        # sets can be compared without rebuilding data. Stage 2 takes this list
+        # from the Stage-1 checkpoint, so the frozen encoder always receives
+        # the exact columns, in the exact order, that it was fitted on.
+        self.gene_index: Optional[np.ndarray] = None
+        if keep_gene_ids is not None:
+            wanted = [str(g) for g in keep_gene_ids]
+            position = {g: i for i, g in enumerate(self.gene_ids)}
+            missing = [g for g in wanted if g not in position]
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} requested gene(s) are absent from the shards, "
+                    f"e.g. {missing[:5]}"
+                )
+            self.gene_index = np.asarray([position[g] for g in wanted], dtype=np.int64)
+            self.gene_ids = wanted
+            self.gene_var = self.gene_var.iloc[self.gene_index].copy()
+            self.gene_symbols = safe_get_gene_symbols(self.gene_var, self.gene_ids)
+
+        self.n_genes = len(self.gene_ids)
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -571,12 +593,17 @@ class PairedH5ADBatchDataset(IterableDataset):
         obs: pd.DataFrame,
         row_idx: np.ndarray,
     ) -> Dict:
-        x_np = transform_expression_rows(
-            to_dense_numpy(adata.X[row_idx, :]), self.expression_transform
-        )
-        y_np = transform_expression_rows(
-            to_dense_numpy(adata.layers["target"][row_idx, :]), self.expression_transform
-        )
+        # Gene subset is applied BEFORE the transform, so normalize_total's
+        # library is the sum over the genes actually being modelled. Stage 1
+        # does the same, in the same order; reversing it in either place would
+        # give the two stages different library sizes for the same cell.
+        x_raw = to_dense_numpy(adata.X[row_idx, :])
+        y_raw = to_dense_numpy(adata.layers["target"][row_idx, :])
+        if self.gene_index is not None:
+            x_raw = x_raw[:, self.gene_index]
+            y_raw = y_raw[:, self.gene_index]
+        x_np = transform_expression_rows(x_raw, self.expression_transform)
+        y_np = transform_expression_rows(y_raw, self.expression_transform)
 
         x = torch.from_numpy(x_np)
         y = torch.from_numpy(y_np)
@@ -724,6 +751,7 @@ def build_paired_h5ad_loader(
     technology_lookup_path: Optional[str | Path] = None,
     keep_technologies: Optional[Iterable[str]] = None,
     allowed_batch_categories: Optional[Iterable[str]] = None,
+    keep_gene_ids: Optional[Iterable[str]] = None,
 ) -> Tuple[PairedH5ADBatchDataset, DataLoader]:
     """
     Build dataset and DataLoader.
@@ -750,6 +778,7 @@ def build_paired_h5ad_loader(
         technology_lookup_path=technology_lookup_path,
         keep_technologies=keep_technologies,
         allowed_batch_categories=allowed_batch_categories,
+        keep_gene_ids=keep_gene_ids,
     )
 
     loader = DataLoader(

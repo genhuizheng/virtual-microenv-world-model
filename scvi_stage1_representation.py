@@ -84,7 +84,11 @@ def peek_checkpoint_metadata(checkpoint_path: str | Path) -> Dict[str, Any]:
         # Older checkpoints predate these fields; they were all raw-count/zinb.
         "expression_transform": payload.get("expression_transform", "none"),
         "gene_likelihood": payload.get("gene_likelihood", "zinb"),
+        "min_cells_detected": payload.get("min_cells_detected", 0),
         "n_genes": payload["n_genes"],
+        # The genes the encoder was actually fitted on, in order. Stage 2 must
+        # subset its columns to exactly this list; the shards still hold the
+        # full unified panel.
         "gene_ids": payload["gene_ids"],
     }
 

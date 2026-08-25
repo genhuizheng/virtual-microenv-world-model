@@ -89,7 +89,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--time-delta-col", type=str, default=None)
     parser.add_argument("--default-time-delta", type=float, default=1.0)
-    parser.add_argument("--expression-transform", choices=["none", "log1p_10k"], default="none")
+    parser.add_argument(
+        "--expression-transform",
+        choices=["none", "log1p_10k"],
+        default=None,
+        help="Defaults to 'none', except with --stage1-scvi-checkpoint, where it is "
+        "adopted from the checkpoint so the frozen encoder always receives the units it "
+        "was fitted on. Passing a value that contradicts the checkpoint is an error.",
+    )
     parser.add_argument("--group-column", type=str, default=None)
     parser.add_argument(
         "--technology-lookup",
@@ -405,17 +412,25 @@ def main() -> None:
         raise ValueError("--stage1-vae-checkpoint and --stage1-scvi-checkpoint are mutually exclusive")
     if args.stage1_vae_checkpoint is not None:
         args.representation_type = "gaussian_vae"
-        if args.expression_transform != "log1p_10k":
+        # The Gaussian VAE is always trained on log1p_10k, so adopt it when the
+        # user said nothing and reject only an explicit contradiction.
+        if args.expression_transform is None:
+            args.expression_transform = "log1p_10k"
+        elif args.expression_transform != "log1p_10k":
             raise ValueError("A Stage-1 Gaussian VAE requires --expression-transform log1p_10k")
         if args.expression_loss_weight > 0 or args.source_recon_loss_weight > 0:
             raise ValueError("Stage-2 training must keep the pretrained VAE frozen")
     if args.stage1_scvi_checkpoint is not None:
         args.representation_type = "scvi"
         # The required transform depends on how Stage 1 was trained: raw counts
-        # for a count likelihood, log1p_10k for a Normal likelihood. Checked
-        # against the checkpoint below, once it has been read.
+        # for a count likelihood, log1p_10k for a Normal likelihood. Adopted
+        # from the checkpoint below, once it has been read.
         if args.expression_loss_weight > 0 or args.source_recon_loss_weight > 0:
             raise ValueError("Stage-2 training must keep the pretrained scVI module frozen")
+    if args.stage1_scvi_checkpoint is None and args.expression_transform is None:
+        # No checkpoint to adopt from (legacy_mlp, or the Gaussian VAE branch
+        # already resolved it): fall back to the historical default.
+        args.expression_transform = "none"
     if args.checkpoint_dir is None:
         variant_part = f"_{args.variant}" if args.variant != "default" else ""
         args.checkpoint_dir = Path(f"checkpoints_level{args.level}{variant_part}_fold{args.fold_index}")
@@ -430,6 +445,7 @@ def main() -> None:
     stage1_batch_key = None
     stage1_keep_technologies = None
     stage1_batch_categories = None
+    stage1_gene_ids = None
     if args.stage1_scvi_checkpoint is not None:
         from scvi_stage1_representation import peek_checkpoint_metadata
 
@@ -440,7 +456,13 @@ def main() -> None:
         print("stage1_keep_technologies:", stage1_keep_technologies)
         print("stage1_gene_likelihood:", stage1_meta["gene_likelihood"])
         print("stage1_expression_transform:", stage1_meta["expression_transform"])
-        if args.expression_transform != stage1_meta["expression_transform"]:
+        # Adopt the checkpoint's transform when the user did not specify one, so
+        # the frozen encoder cannot silently be fed the wrong units. An explicit
+        # contradicting value is still an error rather than being overridden.
+        if args.expression_transform is None:
+            args.expression_transform = stage1_meta["expression_transform"]
+            print(f"expression_transform: adopted {args.expression_transform!r} from checkpoint")
+        elif args.expression_transform != stage1_meta["expression_transform"]:
             raise ValueError(
                 f"Stage 1 was trained with --expression-transform "
                 f"{stage1_meta['expression_transform']!r} (gene_likelihood="
@@ -462,6 +484,12 @@ def main() -> None:
         if mapping:
             stage1_batch_categories = sorted(mapping)
             print(f"stage1_batch_categories: {len(stage1_batch_categories)} known")
+        # Subset to exactly the genes Stage 1 kept, in Stage 1's order.
+        stage1_gene_ids = list(stage1_meta["gene_ids"])
+        print(
+            f"stage1_genes: {len(stage1_gene_ids)}"
+            f" (min_cells_detected={stage1_meta['min_cells_detected']})"
+        )
 
     common_loader_kwargs = dict(
         data_dir=args.data_dir,
@@ -479,6 +507,7 @@ def main() -> None:
         technology_lookup_path=args.technology_lookup,
         keep_technologies=stage1_keep_technologies,
         allowed_batch_categories=stage1_batch_categories,
+        keep_gene_ids=stage1_gene_ids,
     )
 
     train_dataset, train_loader = build_paired_h5ad_loader(
@@ -546,7 +575,10 @@ def main() -> None:
         # (n_genes, latent_dim) inside FiveLevelCellWorldModel.__init__; only
         # gene *order* and freezing remain to be done here.
         if list(model.autoencoder.checkpoint_metadata["gene_ids"]) != list(train_dataset.gene_ids):
-            raise ValueError("Stage-1 scVI checkpoint and paired data have different gene order")
+            raise ValueError(
+                "Stage-1 scVI checkpoint and the loaded data have different genes or gene "
+                "order, even after subsetting to the checkpoint's gene list."
+            )
         model.autoencoder.requires_grad_(False)
         model.autoencoder.eval()
 
