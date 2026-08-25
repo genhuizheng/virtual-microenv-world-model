@@ -20,7 +20,10 @@
 source /home1/10119/ghzheng/.bashrc
 conda activate worldmodeltraining
 
-cd /scratch/10119/ghzheng/Virtual_microenv
+# Locate the repo root relative to this script's own path, not a hardcoded
+# directory -- this script must work regardless of which clone (e.g.
+# Virtual_microenv vs Virtual_microenv_v2) it's run from.
+cd "$(dirname "$(readlink -f "$0")")/.."
 set -e
 
 MODE="${1:-full}"
