@@ -124,7 +124,11 @@ def main() -> None:
     print("  keep_technologies   :", meta["keep_technologies"])
 
     # Rebuild the identical split Stage 1 used, so "held out" means the same
-    # patients here as it did during training.
+    # patients here as it did during training. The checkpoint's gene_ids are the
+    # genes that survived Stage 1's panel restriction AND its detection filter,
+    # so passing them as the panel reproduces the exact input width and order
+    # the encoder was fitted on; min_cells_detected is therefore left at 0.
+    print("  genes               :", meta["n_genes"])
     _, val_adata = build_split_anndata(
         args.data_dir,
         args.group_column,
@@ -134,7 +138,12 @@ def main() -> None:
         technology_lookup_path=args.technology_lookup,
         keep_technologies=keep_technologies,
         expression_transform=meta["expression_transform"],
+        keep_gene_ids=list(meta["gene_ids"]),
     )
+    if val_adata.n_vars != meta["n_genes"]:
+        raise ValueError(
+            f"rebuilt {val_adata.n_vars} genes but the checkpoint expects {meta['n_genes']}"
+        )
     if val_adata.n_obs == 0:
         raise ValueError("Validation split is empty")
 
