@@ -81,6 +81,9 @@ def peek_checkpoint_metadata(checkpoint_path: str | Path) -> Dict[str, Any]:
         "batch_key": payload.get("batch_key"),
         "batch_category_to_index": payload.get("batch_category_to_index"),
         "keep_technologies": payload.get("keep_technologies"),
+        # Older checkpoints predate these fields; they were all raw-count/zinb.
+        "expression_transform": payload.get("expression_transform", "none"),
+        "gene_likelihood": payload.get("gene_likelihood", "zinb"),
         "n_genes": payload["n_genes"],
         "gene_ids": payload["gene_ids"],
     }
@@ -102,6 +105,7 @@ class ScVIExpressionAutoencoder(nn.Module):
         module_state_dict: Dict[str, torch.Tensor],
         batch_category_to_index: Optional[Dict[str, int]] = None,
         reference_library_size: float = 1e4,
+        mean_log_library: Optional[float] = None,
     ):
         super().__init__()
         vae_cls = _load_vae_module_class()
@@ -110,6 +114,13 @@ class ScVIExpressionAutoencoder(nn.Module):
         self.vae_module.load_state_dict(module_state_dict, strict=True)
         self.reference_library_size = float(reference_library_size)
         self.n_latent = int(self.module_init_kwargs["n_latent"])
+        self.gene_likelihood = str(self.module_init_kwargs.get("gene_likelihood", "zinb"))
+        if self.gene_likelihood == "normal" and mean_log_library is None:
+            raise ValueError(
+                "gene_likelihood='normal' requires mean_log_library: its px.loc is "
+                "library-scaled, so decoding needs the scale the model was fitted at."
+            )
+        self.mean_log_library = mean_log_library
         self.batch_category_to_index: Dict[str, int] = dict(
             batch_category_to_index or {_SINGLE_BATCH_KEY: 0}
         )
@@ -157,17 +168,44 @@ class ScVIExpressionAutoencoder(nn.Module):
     def decode(
         self, z: torch.Tensor, batch_categories: Optional[Iterable[str]] = None
     ) -> torch.Tensor:
-        """log1p(px_scale * reference_library_size); see module docstring."""
+        """
+        Decode a latent back to log1p-scale expression.
+
+        The decoding rule depends on the generative likelihood, and the two
+        cases are NOT interchangeable:
+
+        count likelihoods (nb / zinb / poisson)
+            `px.scale` is scVI's library-size-independent normalized expression
+            (sums to 1 across genes). Multiplying by a fixed reference library
+            size and taking log1p puts it in the same units as this project's
+            `log1p_10k` transform.
+
+        normal likelihood
+            The model was trained on already-log1p-normalized input, so the
+            decoded mean `px.loc` is *already* in log1p space and must be
+            returned as-is. Note `px.scale` also exists on a Normal but means
+            the standard deviation -- applying the count-likelihood formula to
+            it would silently return log1p(stddev * library), which is
+            meaningless. Hence the explicit branch rather than a hasattr check.
+        """
         batch_index = self._batch_index(batch_categories, z.shape[0], z.device)
+        log_library = (
+            self.mean_log_library
+            if self.gene_likelihood == "normal"
+            else math.log(self.reference_library_size)
+        )
         library = torch.full(
-            (z.shape[0], 1),
-            math.log(self.reference_library_size),
-            dtype=z.dtype,
-            device=z.device,
+            (z.shape[0], 1), float(log_library), dtype=z.dtype, device=z.device
         )
         generative_out = self.vae_module.generative(z, library, batch_index)
         px = generative_out["px"]
-        px_scale = px.scale if hasattr(px, "scale") else generative_out["px_scale"]
+
+        if self.gene_likelihood == "normal":
+            return px.loc
+
+        px_scale = getattr(px, "scale", None)
+        if px_scale is None:
+            px_scale = generative_out["px_scale"]
         return torch.log1p(px_scale * self.reference_library_size)
 
     def forward(
@@ -192,6 +230,7 @@ class ScVIExpressionAutoencoder(nn.Module):
             # still load (as single-dummy-batch, i.e. no batch correction).
             batch_category_to_index=payload.get("batch_category_to_index"),
             reference_library_size=payload.get("reference_library_size", 1e4),
+            mean_log_library=payload.get("mean_log_library"),
         )
         model.checkpoint_metadata = {
             "n_genes": payload["n_genes"],

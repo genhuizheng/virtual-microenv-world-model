@@ -80,7 +80,15 @@ def to_dense_numpy(x) -> np.ndarray:
 
 
 def transform_expression_rows(x: np.ndarray, transform: str) -> np.ndarray:
-    """Transform raw count rows without modifying the stored H5AD matrices."""
+    """
+    Transform raw count rows without modifying the stored H5AD matrices.
+
+    Dense counterpart of transform_expression_sparse() below. The two MUST
+    produce identical values: Stage 1 transforms a pooled sparse matrix with
+    the sparse version, while Stage 2 transforms dense row blocks with this
+    one, and a frozen encoder is only valid if both stages feed it the same
+    units. Keep them adjacent, and change them together.
+    """
     x = np.asarray(x, dtype=np.float32)
     if transform == "none":
         return x
@@ -88,6 +96,32 @@ def transform_expression_rows(x: np.ndarray, transform: str) -> np.ndarray:
         library_size = x.sum(axis=1, dtype=np.float64, keepdims=True)
         scale = 10_000.0 / np.maximum(library_size, 1.0)
         return np.log1p(x * scale).astype(np.float32)
+    raise ValueError(f"Unknown expression transform: {transform}")
+
+
+def transform_expression_sparse(matrix: sp.spmatrix, transform: str) -> sp.csr_matrix:
+    """
+    Sparse counterpart of transform_expression_rows(); see that docstring.
+
+    log1p(0) == 0, so applying it to the stored nonzero entries alone
+    preserves sparsity exactly -- no densification of a 46k-gene matrix.
+
+    Note on the zero-filled unified gene panel: the per-cell library is the sum
+    over genes that dataset actually measured, since unmeasured genes are
+    stored as exact zeros and contribute nothing. normalize_total is therefore
+    well-defined here. The residual effect -- a cell measured on a narrower
+    panel concentrates the same 1e4 over fewer genes -- is a technical
+    difference between source studies, which is what the batch key corrects.
+    """
+    csr = matrix.tocsr().astype(np.float32)
+    if transform == "none":
+        return csr
+    if transform == "log1p_10k":
+        library = np.asarray(csr.sum(axis=1)).ravel()
+        scale = (1e4 / np.maximum(library, 1.0)).astype(np.float32)
+        scaled = (sp.diags(scale) @ csr).tocsr()
+        scaled.data = np.log1p(scaled.data)
+        return scaled
     raise ValueError(f"Unknown expression transform: {transform}")
 
 
@@ -338,6 +372,7 @@ class PairedH5ADBatchDataset(IterableDataset):
         batch_key: Optional[str] = None,
         technology_lookup_path: Optional[str | Path] = None,
         keep_technologies: Optional[Iterable[str]] = None,
+        allowed_batch_categories: Optional[Iterable[str]] = None,
     ):
         super().__init__()
 
@@ -381,6 +416,17 @@ class PairedH5ADBatchDataset(IterableDataset):
                 "technology_lookup_path is required when keep_technologies is set "
                 "or batch_key='technology'."
             )
+
+        # A frozen encoder can only embed batch categories it was trained on.
+        # Rows outside that set are dropped here rather than raising deep in the
+        # model, which is what happens when a study's patients all landed in the
+        # held-out fold during Stage 1.
+        self.allowed_batch_categories = (
+            None if allowed_batch_categories is None else {str(c) for c in allowed_batch_categories}
+        )
+        if self.allowed_batch_categories is not None and self.batch_key is None:
+            raise ValueError("allowed_batch_categories requires batch_key to be set")
+        self.dropped_unknown_batch_rows = 0
 
         self.manifest_path = self.data_dir / "paired_h5ad_manifest.tsv"
         if not self.manifest_path.exists():
@@ -612,6 +658,14 @@ class PairedH5ADBatchDataset(IterableDataset):
                     adata.file.close()
                     raise
 
+            if self.allowed_batch_categories is not None:
+                categories = np.asarray(self._batch_categories(obs), dtype=object)
+                known = np.array(
+                    [c in self.allowed_batch_categories for c in categories], dtype=bool
+                )
+                self.dropped_unknown_batch_rows += int((~known & eligible_mask).sum())
+                eligible_mask &= known
+
             if self.group_to_fold:
                 if self.group_column not in obs.columns:
                     adata.file.close()
@@ -669,6 +723,7 @@ def build_paired_h5ad_loader(
     batch_key: Optional[str] = None,
     technology_lookup_path: Optional[str | Path] = None,
     keep_technologies: Optional[Iterable[str]] = None,
+    allowed_batch_categories: Optional[Iterable[str]] = None,
 ) -> Tuple[PairedH5ADBatchDataset, DataLoader]:
     """
     Build dataset and DataLoader.
@@ -694,6 +749,7 @@ def build_paired_h5ad_loader(
         batch_key=batch_key,
         technology_lookup_path=technology_lookup_path,
         keep_technologies=keep_technologies,
+        allowed_batch_categories=allowed_batch_categories,
     )
 
     loader = DataLoader(

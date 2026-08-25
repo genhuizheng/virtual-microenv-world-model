@@ -411,11 +411,9 @@ def main() -> None:
             raise ValueError("Stage-2 training must keep the pretrained VAE frozen")
     if args.stage1_scvi_checkpoint is not None:
         args.representation_type = "scvi"
-        if args.expression_transform != "none":
-            raise ValueError(
-                "A Stage-1 scVI encoder requires --expression-transform none (raw counts); "
-                "scVI applies its own internal log1p transform."
-            )
+        # The required transform depends on how Stage 1 was trained: raw counts
+        # for a count likelihood, log1p_10k for a Normal likelihood. Checked
+        # against the checkpoint below, once it has been read.
         if args.expression_loss_weight > 0 or args.source_recon_loss_weight > 0:
             raise ValueError("Stage-2 training must keep the pretrained scVI module frozen")
     if args.checkpoint_dir is None:
@@ -431,6 +429,7 @@ def main() -> None:
     # frozen encoder was fitted on.
     stage1_batch_key = None
     stage1_keep_technologies = None
+    stage1_batch_categories = None
     if args.stage1_scvi_checkpoint is not None:
         from scvi_stage1_representation import peek_checkpoint_metadata
 
@@ -439,12 +438,30 @@ def main() -> None:
         stage1_keep_technologies = stage1_meta["keep_technologies"]
         print("stage1_batch_key:", stage1_batch_key)
         print("stage1_keep_technologies:", stage1_keep_technologies)
+        print("stage1_gene_likelihood:", stage1_meta["gene_likelihood"])
+        print("stage1_expression_transform:", stage1_meta["expression_transform"])
+        if args.expression_transform != stage1_meta["expression_transform"]:
+            raise ValueError(
+                f"Stage 1 was trained with --expression-transform "
+                f"{stage1_meta['expression_transform']!r} (gene_likelihood="
+                f"{stage1_meta['gene_likelihood']!r}), but Stage 2 was given "
+                f"{args.expression_transform!r}. Feeding the frozen encoder different "
+                "units than it was fitted on produces a meaningless latent."
+            )
         needs_lookup = stage1_keep_technologies is not None or stage1_batch_key == "technology"
         if needs_lookup and args.technology_lookup is None:
             raise ValueError(
                 "The Stage-1 checkpoint was trained with a technology filter or "
                 "--batch-key technology; pass the same --technology-lookup to Stage 2."
             )
+        # The frozen encoder can only embed the batch categories it was fitted
+        # on. Cells from a study whose patients all landed in Stage 1's held-out
+        # fold have no trained embedding, so they are dropped by the loader
+        # rather than failing mid-batch.
+        mapping = stage1_meta["batch_category_to_index"]
+        if mapping:
+            stage1_batch_categories = sorted(mapping)
+            print(f"stage1_batch_categories: {len(stage1_batch_categories)} known")
 
     common_loader_kwargs = dict(
         data_dir=args.data_dir,
@@ -461,6 +478,7 @@ def main() -> None:
         batch_key=stage1_batch_key,
         technology_lookup_path=args.technology_lookup,
         keep_technologies=stage1_keep_technologies,
+        allowed_batch_categories=stage1_batch_categories,
     )
 
     train_dataset, train_loader = build_paired_h5ad_loader(

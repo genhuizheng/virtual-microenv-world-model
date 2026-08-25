@@ -44,6 +44,7 @@ from sample_paired_h5ad_dataloader import (
     load_technology_lookup,
     normalize_technology,
     safe_get_gene_symbols,
+    transform_expression_sparse,
 )
 from scvi_stage1_representation import CHECKPOINT_FORMAT
 
@@ -64,7 +65,26 @@ def parse_args() -> argparse.Namespace:
         choices=["gene", "gene-batch", "gene-label", "gene-cell"],
         default="gene",
     )
-    p.add_argument("--gene-likelihood", choices=["zinb", "nb", "poisson"], default="zinb")
+    p.add_argument(
+        "--gene-likelihood",
+        choices=["zinb", "nb", "poisson", "normal"],
+        default="zinb",
+        help="Count likelihoods (zinb/nb/poisson) require raw counts -- the standard "
+        "scVI setup, and the default here. 'normal' requires "
+        "--expression-transform log1p_10k instead: it is the configuration the "
+        "Chreode paper uses (normalize_total(1e4)+log1p with a Normal likelihood). "
+        "Mixing the two -- log1p input with a count likelihood, or raw counts with "
+        "'normal' -- is silently wrong and is rejected.",
+    )
+    p.add_argument(
+        "--expression-transform",
+        choices=["none", "log1p_10k"],
+        default="none",
+        help="'none' keeps raw counts (required for count likelihoods; scVI applies its "
+        "own internal log1p before the encoder and models library size explicitly). "
+        "'log1p_10k' applies normalize_total(1e4)+log1p and is required for "
+        "--gene-likelihood normal.",
+    )
     p.add_argument("--reference-library-size", type=float, default=1e4)
     p.add_argument("--num-folds", type=int, default=5)
     p.add_argument("--fold-index", type=int, default=0)
@@ -225,9 +245,15 @@ def build_split_anndata(
     seed: int,
     technology_lookup_path: Path | None = None,
     keep_technologies: set[str] | None = None,
+    expression_transform: str = "none",
 ) -> tuple[ad.AnnData, ad.AnnData]:
     combined = load_paired_shards_as_role_anndata(data_dir)
     combined = annotate_batch_metadata(combined, technology_lookup_path, keep_technologies)
+    if expression_transform != "none":
+        print(f"applying expression transform {expression_transform!r} to pooled expression")
+    # Same function family the Stage-2 dataloader uses, so both stages feed the
+    # frozen encoder identical units.
+    combined.X = transform_expression_sparse(combined.X, expression_transform)
     if num_folds <= 1:
         return combined, combined[:0].copy()
 
@@ -272,6 +298,23 @@ def main() -> None:
     print("scvi version:", scvi.__version__)
     print("torch version:", torch.__version__)
 
+    # The likelihood and the input transform must agree. A count likelihood is
+    # defined on non-negative integers; a Normal likelihood is not. scvi-tools
+    # does not validate this, so a mismatch would train "successfully" while
+    # modelling the wrong thing.
+    count_likelihoods = {"zinb", "nb", "poisson"}
+    if args.gene_likelihood in count_likelihoods and args.expression_transform != "none":
+        raise ValueError(
+            f"--gene-likelihood {args.gene_likelihood} is a count distribution and requires "
+            "--expression-transform none (raw counts). scVI applies its own log1p before "
+            "the encoder and models library size explicitly."
+        )
+    if args.gene_likelihood == "normal" and args.expression_transform != "log1p_10k":
+        raise ValueError(
+            "--gene-likelihood normal requires --expression-transform log1p_10k. "
+            "A Normal likelihood on raw counts models the wrong scale."
+        )
+
     keep_technologies = None
     if args.keep_technologies:
         keep_technologies = {
@@ -298,6 +341,7 @@ def main() -> None:
         args.seed,
         technology_lookup_path=args.technology_lookup,
         keep_technologies=keep_technologies,
+        expression_transform=args.expression_transform,
     )
     train_adata = subsample(train_adata, args.max_cells, args.seed)
     val_adata = subsample(val_adata, args.max_cells, args.seed + 1)
@@ -319,17 +363,36 @@ def main() -> None:
                 "filtering; a single-category batch key corrects nothing. Either drop "
                 "--batch-key or choose a finer grouping (e.g. source_study)."
             )
-        # Validation cells must belong to categories scVI has seen, otherwise
-        # get_reconstruction_error() cannot embed them.
-        unseen = set(val_adata.obs[batch_key].astype(str)) - set(
-            train_adata.obs[batch_key].astype(str)
-        )
-        if unseen:
+        # A batch category present only in validation has no trained embedding,
+        # so scVI cannot embed those cells at all -- get_reconstruction_error()
+        # raises rather than warns. This is a real consequence of combining a
+        # study-level batch key with patient-level folds: a study whose patients
+        # all land in the held-out fold is never trained on. Drop those cells
+        # and say so, rather than reporting a number computed on random
+        # embeddings.
+        train_categories = set(train_adata.obs[batch_key].astype(str))
+        val_categories = set(val_adata.obs[batch_key].astype(str))
+        unseen = val_categories - train_categories
+        if unseen and val_adata.n_obs:
+            keep = val_adata.obs[batch_key].astype(str).isin(train_categories).to_numpy()
+            dropped = int((~keep).sum())
             print(
-                f"WARNING: {len(unseen)} {batch_key} value(s) appear only in validation "
-                f"and were never trained on, e.g. {sorted(unseen)[:5]}. Their "
-                "reconstruction error is not meaningful."
+                f"WARNING: {len(unseen)} {batch_key} value(s) occur only in the "
+                f"validation split and were never trained on: {sorted(unseen)[:8]}"
+                f"{' ...' if len(unseen) > 8 else ''}"
             )
+            print(
+                f"  dropping {dropped}/{val_adata.n_obs} validation cells "
+                f"({100.0 * dropped / val_adata.n_obs:.2f}%) that belong to them; "
+                "validation error is reported on the remainder."
+            )
+            val_adata = val_adata[keep].copy()
+            if val_adata.n_obs == 0:
+                raise ValueError(
+                    f"Every validation cell belongs to a {batch_key} unseen in training. "
+                    "Use a coarser --batch-key, or a fold assignment that keeps each "
+                    "batch represented in both splits."
+                )
 
     scvi.model.SCVI.setup_anndata(train_adata, batch_key=batch_key)
     use_gpu = args.device in ("auto", "cuda") and torch.cuda.is_available()
@@ -360,6 +423,10 @@ def main() -> None:
         print(f"val_reconstruction_loss={val_reconstruction_error:.6g}")
     else:
         print("num_folds=1: no held-out validation split (full-data training).")
+
+    train_library = np.asarray(train_adata.X.sum(axis=1)).ravel()
+    mean_log_library = float(np.log(np.maximum(train_library, 1.0)).mean())
+    print(f"mean_log_library={mean_log_library:.4f} (exp={np.exp(mean_log_library):.1f})")
 
     n_batch = int(model.summary_stats["n_batch"])
 
@@ -401,6 +468,14 @@ def main() -> None:
         "module_init_kwargs": module_init_kwargs,
         "batch_key": batch_key,
         "batch_category_to_index": batch_category_to_index,
+        # Stage 2 must feed the encoder the same units Stage 1 was trained on.
+        "expression_transform": args.expression_transform,
+        "gene_likelihood": args.gene_likelihood,
+        # Mean log library size over the training cells. The count path decodes
+        # against a fixed 1e4 reference (px_scale is library-independent), but
+        # the Normal path's px.loc IS library-scaled (px = Normal(px_rate, ...)),
+        # so it needs the scale the model was actually fitted at.
+        "mean_log_library": mean_log_library,
         "keep_technologies": sorted(keep_technologies) if keep_technologies else None,
         "reference_library_size": args.reference_library_size,
         "n_genes": train_adata.n_vars,
