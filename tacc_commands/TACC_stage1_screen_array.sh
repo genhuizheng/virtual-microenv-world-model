@@ -40,7 +40,13 @@
 set -eo pipefail
 task_started=$SECONDS
 source /home1/10119/ghzheng/.bashrc
-conda activate worldmodeltraining
+# Override with VM_CONDA_ENV if the environment moves. A bare name is
+# deliberately avoided: it only resolves for whichever conda base happens
+# to be active, which differs between login and compute nodes.
+CONDA_ENV="${VM_CONDA_ENV:-/scratch/10119/ghzheng/conda_envs/worldmodel_withconfidenceot}"
+conda activate "$CONDA_ENV" || { echo "ERROR: cannot activate $CONDA_ENV"; exit 1; }
+echo "conda_env=$CONDA_ENV"
+echo "python=$(command -v python)"
 
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")/..}"
 

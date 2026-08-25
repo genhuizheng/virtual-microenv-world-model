@@ -18,7 +18,13 @@
 # Arguments: mode, data-dir, max-epochs, run tag, fold-index.
 
 source /home1/10119/ghzheng/.bashrc
-conda activate worldmodeltraining
+# Override with VM_CONDA_ENV if the environment moves. A bare name is
+# deliberately avoided: it only resolves for whichever conda base happens
+# to be active, which differs between login and compute nodes.
+CONDA_ENV="${VM_CONDA_ENV:-/scratch/10119/ghzheng/conda_envs/worldmodel_withconfidenceot}"
+conda activate "$CONDA_ENV" || { echo "ERROR: cannot activate $CONDA_ENV"; exit 1; }
+echo "conda_env=$CONDA_ENV"
+echo "python=$(command -v python)"
 
 # Locate the repo root without a hardcoded path. Under `sbatch`, SLURM copies
 # this script into a per-job spool directory before running it, so $0 no
