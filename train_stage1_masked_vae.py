@@ -37,7 +37,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from masked_vae import CHECKPOINT_FORMAT, MaskedGaussianVAE, masked_vae_loss
+from masked_vae import (
+    CHECKPOINT_FORMAT,
+    MaskedGaussianVAE,
+    adversarial_loss,
+    masked_vae_loss,
+)
 from sample_paired_h5ad_dataloader import safe_get_gene_symbols
 from train_stage1_scvi import build_split_anndata
 
@@ -64,6 +69,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--batch-embed-dim", type=int, default=16)
+    p.add_argument(
+        "--adversarial-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the gradient-reversed study classifier. 0 disables it, which "
+        "is the control condition. When > 0 the batch key is used ONLY to supply "
+        "training labels for the adversary -- the encoder and decoder are not "
+        "conditioned on it, so inference needs no batch label and an unseen study is "
+        "not a problem. Mutually exclusive with batch conditioning.",
+    )
+    p.add_argument(
+        "--adversarial-warmup-epochs",
+        type=int,
+        default=10,
+        help="Ramp the adversarial weight linearly from 0 over this many epochs. "
+        "Applying full adversarial pressure to an untrained encoder tends to collapse "
+        "the latent before it has learned anything worth keeping.",
+    )
     p.add_argument(
         "--expression-transform",
         type=str,
@@ -154,6 +177,8 @@ def run_epoch(
     kl_weight: float,
     device: torch.device,
     generator: torch.Generator,
+    study_all: torch.Tensor | None = None,
+    adversarial_weight: float = 0.0,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -161,7 +186,7 @@ def run_epoch(
     order = (
         torch.randperm(n, generator=generator) if training else torch.arange(n)
     )
-    totals = np.zeros(4, dtype=np.float64)
+    totals = np.zeros(6, dtype=np.float64)
     steps = 0
     context = torch.enable_grad if training else torch.no_grad
     with context():
@@ -174,18 +199,34 @@ def run_epoch(
 
             out = model(x, bidx)
             losses = masked_vae_loss(out, x, mask, w, kl_weight)
-            if not torch.isfinite(losses["loss"]):
+            total = losses["loss"]
+
+            adv = torch.zeros((), device=device)
+            adv_acc = torch.zeros((), device=device)
+            if adversarial_weight > 0 and study_all is not None:
+                # The gradient reversal is inside adversarial_logits, so ADDING
+                # this term trains the classifier to predict study while pushing
+                # the encoder to make study unpredictable.
+                parts = adversarial_loss(
+                    model, out["mu"], study_all[idx].to(device), adversarial_weight
+                )
+                adv, adv_acc = parts["adversarial"], parts["adversarial_accuracy"]
+                total = total + adv
+
+            if not torch.isfinite(total):
                 raise FloatingPointError("Non-finite masked-VAE loss")
             if training:
                 optimizer.zero_grad(set_to_none=True)
-                losses["loss"].backward()
+                total.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
             totals += [
-                float(losses["loss"].detach()),
+                float(total.detach()),
                 float(losses["reconstruction"].detach()),
                 float(losses["kl"].detach()),
                 float(losses["mean_measured_genes"].detach()),
+                float(adv.detach()),
+                float(adv_acc.detach()),
             ]
             steps += 1
     if steps == 0:
@@ -197,6 +238,8 @@ def run_epoch(
         "reconstruction": mean[1],
         "kl": mean[2],
         "mean_measured_genes": mean[3],
+        "adversarial": mean[4],
+        "adversarial_accuracy": mean[5],
     }
 
 
@@ -262,6 +305,13 @@ def main() -> None:
     else:
         print("WARNING: no --gene-mask-npz; training WITHOUT masking (control condition)")
 
+    if args.adversarial_weight > 0 and args.batch_key == "none":
+        raise ValueError(
+            "--adversarial-weight needs --batch-key to supply training labels for the "
+            "study classifier. The encoder/decoder are NOT conditioned on it; the labels "
+            "are used only to train the adversary."
+        )
+
     batch_key = None if args.batch_key == "none" else args.batch_key
     batch_category_to_index: dict[str, int] | None = None
     train_batch = val_batch = None
@@ -306,31 +356,73 @@ def main() -> None:
         if val_adata.n_obs:
             w_val = torch.as_tensor(val_adata.obs["probability"].to_numpy(dtype=np.float32))
 
-    model = MaskedGaussianVAE(
-        n_genes=len(gene_ids),
-        latent_dim=args.latent_dim,
-        hidden_dim=args.n_hidden,
-        n_layers=args.n_layers,
-        dropout=args.dropout,
-        n_batches=len(batch_category_to_index) if batch_category_to_index else 1,
-        batch_embed_dim=args.batch_embed_dim,
-    ).to(device)
+    # Built once and reused verbatim in the checkpoint, so the saved
+    # architecture always matches what was actually constructed. Deriving these
+    # again at save time is how an adversarial model ends up recorded as a
+    # conditioned one and fails to reload.
+    module_init_kwargs = {
+        "n_genes": len(gene_ids),
+        "latent_dim": args.latent_dim,
+        "hidden_dim": args.n_hidden,
+        "n_layers": args.n_layers,
+        "dropout": args.dropout,
+        # Adversarial invariance and batch conditioning are alternatives. With
+        # the adversary on, the model carries no batch embedding at all, which
+        # is what makes inference label-free on an unseen study.
+        "n_batches": 1 if args.adversarial_weight > 0
+        else (len(batch_category_to_index) if batch_category_to_index else 1),
+        "batch_embed_dim": args.batch_embed_dim,
+        "n_adversarial_classes": (
+            len(batch_category_to_index)
+            if args.adversarial_weight > 0 and batch_category_to_index
+            else 0
+        ),
+    }
+    model = MaskedGaussianVAE(**module_init_kwargs).to(device)
+    if args.adversarial_weight > 0:
+        print(
+            f"adversarial: weight={args.adversarial_weight} over "
+            f"{len(batch_category_to_index)} studies, warmup={args.adversarial_warmup_epochs} epochs "
+            f"(encoder/decoder NOT conditioned; inference needs no batch label)"
+        )
+        chance = 1.0 / max(len(batch_category_to_index), 1)
+        print(f"  adversary accuracy should fall toward chance = {chance:.4f}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # With the adversary on, the model has no batch embedding, so no batch index
+    # is fed to encoder/decoder -- the labels go to the classifier instead.
+    cond_train = None if args.adversarial_weight > 0 else train_batch
+    cond_val = None if args.adversarial_weight > 0 else val_batch
+    study_train = train_batch if args.adversarial_weight > 0 else None
+    study_val = val_batch if args.adversarial_weight > 0 else None
 
     rows, best = [], float("inf")
     for epoch in range(args.max_epochs):
-        tr = run_epoch(model, x_train, m_train, train_batch, w_train, optimizer,
-                       args.batch_size, args.kl_weight, device, generator)
+        # Linear warmup: full adversarial pressure on an untrained encoder tends
+        # to collapse the latent before it has learned anything worth keeping.
+        if args.adversarial_warmup_epochs > 0:
+            ramp = min(1.0, (epoch + 1) / args.adversarial_warmup_epochs)
+        else:
+            ramp = 1.0
+        adv_w = args.adversarial_weight * ramp
+
+        tr = run_epoch(model, x_train, m_train, cond_train, w_train, optimizer,
+                       args.batch_size, args.kl_weight, device, generator,
+                       study_all=study_train, adversarial_weight=adv_w)
         if x_val is not None:
-            va = run_epoch(model, x_val, m_val, val_batch, w_val, None,
-                           args.batch_size, args.kl_weight, device, generator)
+            va = run_epoch(model, x_val, m_val, cond_val, w_val, None,
+                           args.batch_size, args.kl_weight, device, generator,
+                           study_all=study_val, adversarial_weight=adv_w)
         else:
             va = {k: float("nan") for k in tr}
         rows.append({"epoch": epoch, **{f"train_{k}": v for k, v in tr.items()},
                      **{f"val_{k}": v for k, v in va.items()}})
         if epoch % 5 == 0 or epoch == args.max_epochs - 1:
-            print(f"epoch={epoch} train={tr['loss']:.6g} val={va['loss']:.6g} "
-                  f"recon={va['reconstruction']:.6g} measured={tr['mean_measured_genes']:.0f}")
+            msg = (f"epoch={epoch} train={tr['loss']:.6g} val={va['loss']:.6g} "
+                   f"recon={va['reconstruction']:.6g} measured={tr['mean_measured_genes']:.0f}")
+            if args.adversarial_weight > 0:
+                msg += (f" adv_w={adv_w:.3f} adv_acc={tr['adversarial_accuracy']:.4f}")
+            print(msg)
 
         score = va["loss"] if x_val is not None else tr["loss"]
         if score < best:
@@ -339,21 +431,14 @@ def main() -> None:
                 {
                     "format": CHECKPOINT_FORMAT,
                     "module_state_dict": model.state_dict(),
-                    "module_init_kwargs": {
-                        "n_genes": len(gene_ids),
-                        "latent_dim": args.latent_dim,
-                        "hidden_dim": args.n_hidden,
-                        "n_layers": args.n_layers,
-                        "dropout": args.dropout,
-                        "n_batches": len(batch_category_to_index) if batch_category_to_index else 1,
-                        "batch_embed_dim": args.batch_embed_dim,
-                    },
+                    "module_init_kwargs": module_init_kwargs,
                     "batch_key": batch_key,
                     "batch_category_to_index": batch_category_to_index,
                     "expression_transform": args.expression_transform,
                     "min_cells_detected": args.min_cells_detected,
                     "keep_technologies": sorted(keep_technologies) if keep_technologies else None,
                     "masked": mask_index is not None,
+                    "adversarial_weight": args.adversarial_weight,
                     "n_genes": len(gene_ids),
                     "gene_ids": gene_ids,
                     "gene_symbols": safe_get_gene_symbols(train_adata.var, gene_ids),

@@ -56,6 +56,34 @@ from torch import nn
 CHECKPOINT_FORMAT = "stage1_masked_vae_v1"
 
 
+class GradientReversal(torch.autograd.Function):
+    """Identity forward; sign-flipped, scaled gradient backward.
+
+    The mechanism behind adversarial batch invariance. A study classifier sits
+    on the latent and is trained normally to predict which study a cell came
+    from. Because its gradient reaches the encoder reversed, the encoder is
+    pushed in the opposite direction -- to make study identity *unpredictable*
+    from the latent.
+
+    The point, versus conditioning the decoder on a batch covariate: study
+    labels are used ONLY during training. At inference the encoder takes any
+    cell with no label at all, so a study never seen in training is not a
+    problem. That is the property `source_study` conditioning cannot provide,
+    and measurements on this data showed conditioning only reduces study
+    clustering from 14.3x to 10.4x chance anyway -- a partial fix bought at the
+    cost of new-dataset transfer.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        return -ctx.lambd * grad_output, None
+
+
 class MaskedGaussianVAE(nn.Module):
     """Conditional Gaussian VAE whose reconstruction is masked per cell."""
 
@@ -68,6 +96,8 @@ class MaskedGaussianVAE(nn.Module):
         dropout: float = 0.1,
         n_batches: int = 1,
         batch_embed_dim: int = 16,
+        n_adversarial_classes: int = 0,
+        adversarial_hidden: int = 128,
     ):
         super().__init__()
         if n_layers < 1:
@@ -94,6 +124,32 @@ class MaskedGaussianVAE(nn.Module):
         self.encoder_mu = nn.Linear(hidden_dim, self.latent_dim)
         self.encoder_logvar = nn.Linear(hidden_dim, self.latent_dim)
         self.decoder = mlp(self.latent_dim + self.batch_embed_dim, self.n_genes)
+
+        # Adversarial study classifier. Deliberately separate from the batch
+        # embedding above: conditioning and adversarial invariance are two
+        # different strategies, and combining both would let the decoder use a
+        # batch label the encoder is simultaneously being trained to forget.
+        self.n_adversarial_classes = int(n_adversarial_classes)
+        if self.n_adversarial_classes > 1:
+            if self.batch_embed_dim:
+                raise ValueError(
+                    "Adversarial invariance and batch conditioning are alternatives, not "
+                    "complements: conditioning hands the decoder a label the encoder is "
+                    "being trained to discard, and inference would still require that "
+                    "label. Use n_batches=1 with adversarial training."
+                )
+            self.adversary = nn.Sequential(
+                nn.Linear(self.latent_dim, adversarial_hidden),
+                nn.LayerNorm(adversarial_hidden),
+                nn.GELU(),
+                nn.Linear(adversarial_hidden, self.n_adversarial_classes),
+            )
+
+    def adversarial_logits(self, z: torch.Tensor, lambd: float) -> torch.Tensor:
+        """Study logits from a gradient-reversed latent."""
+        if self.n_adversarial_classes <= 1:
+            raise ValueError("model has no adversarial head")
+        return self.adversary(GradientReversal.apply(z, lambd))
 
     def _with_batch(self, x: torch.Tensor, batch_index: Optional[torch.Tensor]) -> torch.Tensor:
         if not self.batch_embed_dim:
@@ -185,6 +241,29 @@ def masked_vae_loss(
         "kl": kl,
         "mean_measured_genes": measured.mean(),
     }
+
+
+def adversarial_loss(
+    model: "MaskedGaussianVAE",
+    z: torch.Tensor,
+    study_index: torch.Tensor,
+    lambd: float,
+) -> Dict[str, torch.Tensor]:
+    """
+    Cross-entropy of the gradient-reversed study classifier, plus its accuracy.
+
+    Accuracy is the number to watch, and it is more interpretable than the
+    loss: it should FALL toward chance (1 / n_studies) as training proceeds.
+    An accuracy that stays high means the encoder is still writing study
+    identity into the latent and the adversary is not winning; one that
+    collapses to chance immediately usually means the latent has been degraded
+    rather than made invariant -- check the role metric before believing it.
+    """
+    logits = model.adversarial_logits(z, lambd)
+    loss = torch.nn.functional.cross_entropy(logits, study_index)
+    with torch.no_grad():
+        accuracy = (logits.argmax(dim=1) == study_index).float().mean()
+    return {"adversarial": loss, "adversarial_accuracy": accuracy}
 
 
 class MaskedVAERepresentation(nn.Module):
