@@ -1,0 +1,18 @@
+# Configs promoted from the fold-0 screen to full cross-validation.
+# One tag per line; each must match a `tag` in stage1_screen_configs.tsv,
+# from which all its hyperparameters are read.
+#
+# These three are deliberately chosen to differ on the ONE axis the screen
+# showed actually matters. Likelihood (zinb/nb/poisson within 0.5%) and panel
+# size (15k vs 26k, identical) were inert, so promoting the composite's literal
+# top 3 would have been three spellings of the same configuration.
+#
+#   p90_nob_nb      no batch correction   -> best role (1.38x), worst mixing (13.3x)
+#   p90_bat_nb      source_study, counts  -> mixing 8.6x, role 1.32x
+#   p90_bat_log1p   source_study, log1p   -> best mixing of the strong performers
+#                                            (7.4x) at role 1.24x
+#
+# Fold 0 already exists from the screen, so only folds 1-4 need running.
+p90_nob_nb
+p90_bat_nb
+p90_bat_log1p
