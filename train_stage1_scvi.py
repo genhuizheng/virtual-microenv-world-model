@@ -47,7 +47,7 @@ from sample_paired_h5ad_dataloader import (
     safe_get_gene_symbols,
     transform_expression_sparse,
 )
-from scvi_stage1_representation import CHECKPOINT_FORMAT
+from scvi_stage1_representation import CHECKPOINT_FORMAT, resolve_decode_units
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Cap total pooled source+target cells per split; -1 uses everything. "
         "For quick smoke tests only.",
+    )
+    p.add_argument(
+        "--decode-units",
+        choices=["auto", "counts", "log1p_10k"],
+        default="auto",
+        help="Units decode() returns. 'auto' mirrors --expression-transform, giving a "
+        "symmetric autoencoder: raw counts in -> raw counts out, log1p_10k in -> "
+        "log1p_10k out. Set explicitly to decouple them (e.g. counts in, log1p out, "
+        "which is what checkpoints written before this flag existed always did).",
     )
     p.add_argument("--early-stopping", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", type=str, default="auto")
@@ -388,6 +397,13 @@ def main() -> None:
             "--gene-likelihood normal requires --expression-transform log1p_10k or "
             "bin_<N>. A Normal likelihood on raw counts models the wrong scale."
         )
+    # Resolved once here so the printed value, the checkpoint field and the
+    # wrapper's runtime behaviour cannot disagree.
+    decode_units = resolve_decode_units(args.decode_units, args.expression_transform)
+    print(
+        f"units: input={args.expression_transform!r} -> decode()={decode_units!r}"
+        + ("  (symmetric)" if args.decode_units == "auto" else "  (explicit)")
+    )
     if is_binned:
         # Bin indices are ranks, not abundances: they have no library size, and
         # scVI's decoder still applies library scaling. mean_log_library (used
@@ -571,6 +587,8 @@ def main() -> None:
         "batch_category_to_index": batch_category_to_index,
         # Stage 2 must feed the encoder the same units Stage 1 was trained on.
         "expression_transform": args.expression_transform,
+        # ... and anything reading decode() back needs to know what comes out.
+        "decode_units": decode_units,
         "gene_likelihood": args.gene_likelihood,
         "min_cells_detected": args.min_cells_detected,
         # Mean log library size over the training cells. The count path decodes

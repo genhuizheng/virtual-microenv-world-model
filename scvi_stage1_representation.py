@@ -58,6 +58,26 @@ from torch import nn
 CHECKPOINT_FORMAT = "stage1_scvi_v1"
 _SINGLE_BATCH_KEY = "__single_batch__"
 
+# Units decode() may return. These are the OUTPUT half of the unit convention;
+# the INPUT half is `expression_transform` (none -> raw counts, log1p_10k ->
+# log1p). "auto" mirrors the input so the autoencoder is symmetric: counts in,
+# counts out; log1p in, log1p out.
+DECODE_UNITS = ("counts", "log1p_10k")
+
+
+def resolve_decode_units(decode_units: str, expression_transform: str) -> str:
+    """Turn 'auto' into the concrete unit that mirrors the encoder's input."""
+    if decode_units != "auto":
+        if decode_units not in DECODE_UNITS:
+            raise ValueError(
+                f"Unknown decode_units {decode_units!r}; expected one of "
+                f"{('auto',) + DECODE_UNITS}"
+            )
+        return decode_units
+    # A binned transform (bin_<N>) has no meaningful inverse in expression
+    # space, so log1p_10k is the only sane readable output there.
+    return "counts" if expression_transform == "none" else "log1p_10k"
+
 
 def peek_checkpoint_metadata(checkpoint_path: str | Path) -> Dict[str, Any]:
     """
@@ -83,6 +103,7 @@ def peek_checkpoint_metadata(checkpoint_path: str | Path) -> Dict[str, Any]:
         "keep_technologies": payload.get("keep_technologies"),
         # Older checkpoints predate these fields; they were all raw-count/zinb.
         "expression_transform": payload.get("expression_transform", "none"),
+        "decode_units": payload.get("decode_units", "log1p_10k"),
         "gene_likelihood": payload.get("gene_likelihood", "zinb"),
         "min_cells_detected": payload.get("min_cells_detected", 0),
         # Part of the contract: Stage 2's transition operates in this latent, so
@@ -113,6 +134,8 @@ class ScVIExpressionAutoencoder(nn.Module):
         batch_category_to_index: Optional[Dict[str, int]] = None,
         reference_library_size: float = 1e4,
         mean_log_library: Optional[float] = None,
+        decode_units: str = "log1p_10k",
+        expression_transform: str = "none",
     ):
         super().__init__()
         vae_cls = _load_vae_module_class()
@@ -128,6 +151,8 @@ class ScVIExpressionAutoencoder(nn.Module):
                 "library-scaled, so decoding needs the scale the model was fitted at."
             )
         self.mean_log_library = mean_log_library
+        self.expression_transform = str(expression_transform)
+        self.decode_units = resolve_decode_units(decode_units, self.expression_transform)
         self.batch_category_to_index: Dict[str, int] = dict(
             batch_category_to_index or {_SINGLE_BATCH_KEY: 0}
         )
@@ -173,28 +198,46 @@ class ScVIExpressionAutoencoder(nn.Module):
         return qz.loc
 
     def decode(
-        self, z: torch.Tensor, batch_categories: Optional[Iterable[str]] = None
+        self,
+        z: torch.Tensor,
+        batch_categories: Optional[Iterable[str]] = None,
+        units: Optional[str] = None,
     ) -> torch.Tensor:
         """
-        Decode a latent back to log1p-scale expression.
+        Decode a latent back to expression, in `units` (default self.decode_units).
 
-        The decoding rule depends on the generative likelihood, and the two
-        cases are NOT interchangeable:
+        Two independent things decide the arithmetic here. Conflating them is
+        the easiest way to get silently wrong numbers, so they are separate:
 
-        count likelihoods (nb / zinb / poisson)
-            `px.scale` is scVI's library-size-independent normalized expression
-            (sums to 1 across genes). Multiplying by a fixed reference library
-            size and taking log1p puts it in the same units as this project's
-            `log1p_10k` transform.
+        1. THE LIKELIHOOD decides what the generative head means.
 
-        normal likelihood
-            The model was trained on already-log1p-normalized input, so the
-            decoded mean `px.loc` is *already* in log1p space and must be
-            returned as-is. Note `px.scale` also exists on a Normal but means
-            the standard deviation -- applying the count-likelihood formula to
-            it would silently return log1p(stddev * library), which is
-            meaningless. Hence the explicit branch rather than a hasattr check.
+           count likelihoods (nb / zinb / poisson)
+               `px.scale` is scVI's library-size-independent normalized
+               expression (sums to 1 across genes). Multiplying by a fixed
+               reference library size gives expected counts at that library.
+
+           normal likelihood
+               The model was trained on already-log1p-normalized input, so
+               `px.loc` is *already* in log1p space. Note `px.scale` also
+               exists on a Normal but means the standard deviation -- applying
+               the count formula to it would return log1p(stddev * library),
+               which is meaningless. Hence the explicit branch, not a hasattr
+               check.
+
+        2. THE REQUESTED UNITS decide the final scale, and the conversion runs
+           in whichever direction is needed:
+
+               counts     <-> log1p_10k        via log1p / expm1
+
+           So a count-likelihood model can return log1p, and a Normal-likelihood
+           model can return counts. `decode_units="auto"` at training time makes
+           this mirror the encoder's input, giving a symmetric autoencoder:
+           counts in -> counts out, log1p in -> log1p out.
         """
+        units = self.decode_units if units is None else units
+        if units not in DECODE_UNITS:
+            raise ValueError(f"Unknown units {units!r}; expected one of {DECODE_UNITS}")
+
         batch_index = self._batch_index(batch_categories, z.shape[0], z.device)
         log_library = (
             self.mean_log_library
@@ -208,12 +251,14 @@ class ScVIExpressionAutoencoder(nn.Module):
         px = generative_out["px"]
 
         if self.gene_likelihood == "normal":
-            return px.loc
+            # px.loc is log1p-scale.
+            return px.loc if units == "log1p_10k" else torch.expm1(px.loc)
 
         px_scale = getattr(px, "scale", None)
         if px_scale is None:
             px_scale = generative_out["px_scale"]
-        return torch.log1p(px_scale * self.reference_library_size)
+        counts = px_scale * self.reference_library_size
+        return counts if units == "counts" else torch.log1p(counts)
 
     def forward(
         self, x: torch.Tensor, batch_categories: Optional[Iterable[str]] = None
@@ -238,6 +283,11 @@ class ScVIExpressionAutoencoder(nn.Module):
             batch_category_to_index=payload.get("batch_category_to_index"),
             reference_library_size=payload.get("reference_library_size", 1e4),
             mean_log_library=payload.get("mean_log_library"),
+            # Checkpoints written before decode_units existed always returned
+            # log1p, so that stays the fallback -- an old checkpoint must not
+            # change meaning because the code learned a new option.
+            decode_units=payload.get("decode_units", "log1p_10k"),
+            expression_transform=payload.get("expression_transform", "none"),
         )
         model.checkpoint_metadata = {
             "n_genes": payload["n_genes"],

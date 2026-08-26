@@ -218,23 +218,34 @@ def main() -> None:
         val_adata.obs[meta["batch_key"]].astype(str).tolist() if meta["batch_key"] else None
     )
 
-    # The reconstruction target must be in whatever units decode() returns,
-    # which depends on the likelihood:
-    #   count likelihoods -> log1p(px_scale * reference_library), so the target
-    #                        is log1p even though the encoder consumed counts
-    #   normal likelihood -> px.loc, i.e. the same units the encoder consumed
-    #                        (log1p_10k, or bin indices for a bin_<N> transform)
-    # Getting this wrong silently scores predictions against the wrong scale --
-    # comparing bin-space output to a log1p target, for instance.
+    # The reconstruction target must be in whatever units decode() returns.
+    # That is now an explicit checkpoint field (decode_units) rather than
+    # something inferred from the likelihood: a count-likelihood model can be
+    # asked for counts or for log1p, so the likelihood alone no longer
+    # determines it. Getting this wrong silently scores predictions against the
+    # wrong scale -- comparing counts to a log1p target would report a huge MSE
+    # for a model that is reconstructing perfectly.
     from sample_paired_h5ad_dataloader import transform_expression_sparse
 
-    if meta.get("expression_transform", "none") == "none":
-        target_matrix = transform_expression_sparse(val_adata.X, "log1p_10k")
-        recon_units = "log1p_10k"
+    input_transform = meta.get("expression_transform", "none")
+    recon_units = meta.get("decode_units", "log1p_10k")
+    if input_transform == "none":
+        # val_adata.X is raw counts; produce whichever side decode() returns.
+        if recon_units == "counts":
+            target_matrix = val_adata.X
+        else:
+            target_matrix = transform_expression_sparse(val_adata.X, "log1p_10k")
     else:
-        target_matrix = val_adata.X
-        recon_units = meta.get("expression_transform", "none")
-    print("  reconstruction units:", recon_units)
+        # val_adata.X already carries the encoder's input transform (log1p_10k
+        # or bin_<N>). decode() returns those same units unless counts were
+        # explicitly requested, which only inverts a log1p.
+        if recon_units == "counts" and input_transform == "log1p_10k":
+            target_matrix = val_adata.X.copy()
+            target_matrix.data = np.expm1(target_matrix.data)
+        else:
+            target_matrix = val_adata.X
+            recon_units = input_transform
+    print(f"  reconstruction units: {recon_units}  (encoder input: {input_transform})")
 
     # Optional per-cell measured-gene mask. Scoring reconstruction against a
     # structural zero measures agreement with padding, not with biology, so

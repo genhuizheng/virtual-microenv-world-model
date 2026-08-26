@@ -418,6 +418,19 @@ def main() -> None:
         raise ValueError("--max-val-steps must be -1 or a positive integer")
     if args.stage1_vae_checkpoint is not None and args.stage1_scvi_checkpoint is not None:
         raise ValueError("--stage1-vae-checkpoint and --stage1-scvi-checkpoint are mutually exclusive")
+    if args.loss_mode == "expression_mse" and args.stage1_scvi_checkpoint is not None:
+        # loss_expr compares model.decode(z) against the loader's y. With a
+        # count-likelihood scVI Stage 1 those are in DIFFERENT UNITS: decode()
+        # returns log1p(px_scale * 1e4) while y is raw counts (the encoder
+        # requires counts, so --expression-transform is 'none'). The MSE would
+        # be silently meaningless -- large, and minimised by predicting the
+        # wrong thing. The two other decode() paths, --expression-loss-weight
+        # and --source-recon-loss-weight, already refuse a frozen Stage 1.
+        raise ValueError(
+            "--loss-mode expression_mse is incompatible with a frozen scVI Stage 1: "
+            "decode() returns log1p_10k but the loader supplies raw counts. "
+            "Use --loss-mode pair_mse (latent MSE) or chreode (distributional)."
+        )
     if args.stage1_vae_checkpoint is not None:
         args.representation_type = "gaussian_vae"
         # The Gaussian VAE is always trained on log1p_10k, so adopt it when the

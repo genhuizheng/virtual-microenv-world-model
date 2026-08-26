@@ -1,0 +1,16 @@
+tag	trainer	use_mask	gene_likelihood	expression_transform	latent_dim	n_hidden	n_layers	dispersion	batch_key	gene_list	note
+p90_bat_zinb	scvi	no	zinb	none	128	512	2	gene	source_study	90pct	counts in | batch | ZINB
+p90_bat_nb	scvi	no	nb	none	128	512	2	gene	source_study	90pct	counts in | batch | NB
+p90_bat_poisson	scvi	no	poisson	none	128	512	2	gene	source_study	90pct	counts in | batch | Poisson
+p90_bat_log1p	scvi	no	normal	log1p_10k	128	512	2	gene	source_study	90pct	LOG1P->LOG1P | batch | Normal
+p90_bat_bin51	scvi	no	normal	bin_51	128	512	2	gene	source_study	90pct	scGPT bins | batch | Normal
+p90_nob_zinb	scvi	no	zinb	none	128	512	2	gene	none	90pct	counts in | no batch | ZINB
+p90_nob_nb	scvi	no	nb	none	128	512	2	gene	none	90pct	counts in | no batch | NB
+p90_nob_poisson	scvi	no	poisson	none	128	512	2	gene	none	90pct	counts in | no batch | Poisson
+p90_nob_log1p	scvi	no	normal	log1p_10k	128	512	2	gene	none	90pct	LOG1P->LOG1P | no batch | Normal
+p90_nob_bin51	scvi	no	normal	bin_51	128	512	2	gene	none	90pct	scGPT bins | no batch | Normal
+p90_tech_nb	scvi	no	nb	none	128	512	2	gene	technology	90pct	counts in | technology batch | NB
+p90_tech_normal	scvi	no	normal	log1p_10k	128	512	2	gene	technology	90pct	LOG1P->LOG1P | technology batch | Normal
+m90_bat_log1p_mask	masked	yes	na	log1p_10k	128	512	2	na	source_study	90pct	MASKED VAE | batch | log1p
+m90_nob_log1p_mask	masked	yes	na	log1p_10k	128	512	2	na	none	90pct	NEW: MASKED VAE | no batch | log1p -- p50 had this, p90 did not
+m90_bat_log1p_full	masked	no	na	log1p_10k	128	512	2	na	source_study	90pct	NEW: same net, NO mask -- isolates masking from model family
