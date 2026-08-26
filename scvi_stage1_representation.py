@@ -85,6 +85,9 @@ def peek_checkpoint_metadata(checkpoint_path: str | Path) -> Dict[str, Any]:
         "expression_transform": payload.get("expression_transform", "none"),
         "gene_likelihood": payload.get("gene_likelihood", "zinb"),
         "min_cells_detected": payload.get("min_cells_detected", 0),
+        # Part of the contract: Stage 2's transition operates in this latent, so
+        # it should adopt the dimension rather than be told it separately.
+        "latent_dim": int(payload["module_init_kwargs"]["n_latent"]),
         "n_genes": payload["n_genes"],
         # The genes the encoder was actually fitted on, in order. Stage 2 must
         # subset its columns to exactly this list; the shards still hold the

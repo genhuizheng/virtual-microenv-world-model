@@ -60,7 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--latent-dim", type=int, default=128)
+    parser.add_argument(
+        "--latent-dim",
+        type=int,
+        default=None,
+        help="Defaults to 128, except with --stage1-scvi-checkpoint, where it is "
+        "adopted from the checkpoint: the transition operates inside that latent, so "
+        "the dimension is part of the Stage-1 contract rather than a free choice. "
+        "Passing a value that contradicts the checkpoint is an error.",
+    )
     parser.add_argument("--expression-hidden-dim", type=int, default=1024)
     parser.add_argument("--expression-depth", type=int, default=3)
     parser.add_argument(
@@ -427,6 +435,8 @@ def main() -> None:
         # from the checkpoint below, once it has been read.
         if args.expression_loss_weight > 0 or args.source_recon_loss_weight > 0:
             raise ValueError("Stage-2 training must keep the pretrained scVI module frozen")
+    if args.stage1_scvi_checkpoint is None and args.latent_dim is None:
+        args.latent_dim = 128
     if args.stage1_scvi_checkpoint is None and args.expression_transform is None:
         # No checkpoint to adopt from (legacy_mlp, or the Gaussian VAE branch
         # already resolved it): fall back to the historical default.
@@ -454,6 +464,16 @@ def main() -> None:
         stage1_keep_technologies = stage1_meta["keep_technologies"]
         print("stage1_batch_key:", stage1_batch_key)
         print("stage1_keep_technologies:", stage1_keep_technologies)
+        print("stage1_latent_dim:", stage1_meta["latent_dim"])
+        if args.latent_dim is None:
+            args.latent_dim = stage1_meta["latent_dim"]
+            print(f"latent_dim: adopted {args.latent_dim} from checkpoint")
+        elif args.latent_dim != stage1_meta["latent_dim"]:
+            raise ValueError(
+                f"Stage 1 has latent_dim {stage1_meta['latent_dim']} but Stage 2 was given "
+                f"{args.latent_dim}. The transition operates inside the frozen latent, so "
+                "these must agree."
+            )
         print("stage1_gene_likelihood:", stage1_meta["gene_likelihood"])
         print("stage1_expression_transform:", stage1_meta["expression_transform"])
         # Adopt the checkpoint's transform when the user did not specify one, so

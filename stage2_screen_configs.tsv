@@ -1,0 +1,14 @@
+tag	level	variant	loss_mode	note
+level0_identity	0	default	pair_mse	non-learned baseline: predicts no change. The floor every model must beat
+level1_transformer	1	default	pair_mse	plain Transformer residual
+level2_dit	2	default	pair_mse	DiT residual (AdaLN-Zero)
+level3_gated_dit	3	default	pair_mse	DiT residual + learned elapsed-time gate
+level4_waddington	4	default	pair_mse	Chreode-style potential + rotational + stochastic residual
+level5_stochastic	5	default	pair_mse	AdaLN-Zero DiT, stochastic residual head
+level5_tokenized	5	tokenized_dit	pair_mse	deterministic tokenized latent DiT
+level5_crossattn	5	cross_attention_dit	pair_mse	tokenized DiT + cross-attention context path
+level5_hierarchical	5	hierarchical_dit	pair_mse	hierarchical / U-Net-inspired token DiT
+level5_consistency	5	consistency_dit	pair_mse	one-step consistency-style, direct + residual heads
+level5_rectified	5	rectified_dit	pair_mse	rectified-flow-inspired one-step displacement
+level6_cellflow_pair	6	default	pair_mse	CellFlow velocity field, scored on the SAME objective as every other level
+level6_cellflow_fm	6	default	cellflow	CellFlow with its native flow-matching objective

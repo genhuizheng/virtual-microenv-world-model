@@ -33,10 +33,15 @@
 
 set -eo pipefail
 task_started=$SECONDS
-source /home1/10119/ghzheng/.bashrc
-CONDA_ENV="${VM_CONDA_ENV:-/scratch/10119/ghzheng/conda_envs/worldmodel_withconfidenceot}"
-conda activate "$CONDA_ENV" || { echo "ERROR: cannot activate $CONDA_ENV"; exit 1; }
-echo "conda_env=$CONDA_ENV"
+# Set VM_SKIP_ENV=1 to use the already-active environment (local testing, or
+# when the caller has activated it). Sourcing .bashrc is non-fatal: an
+# unrelated failure in a shell profile should not take down a compute job.
+if [[ -z "${VM_SKIP_ENV:-}" ]]; then
+  [[ -f /home1/10119/ghzheng/.bashrc ]] && source /home1/10119/ghzheng/.bashrc || true
+  CONDA_ENV="${VM_CONDA_ENV:-/scratch/10119/ghzheng/conda_envs/worldmodel_withconfidenceot}"
+  conda activate "$CONDA_ENV" || { echo "ERROR: cannot activate $CONDA_ENV"; exit 1; }
+  echo "conda_env=$CONDA_ENV"
+fi
 echo "python=$(command -v python)"
 
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")/..}"
