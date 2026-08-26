@@ -633,11 +633,18 @@ def main() -> None:
     )
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    # Select the checkpoint with the same objective that is optimized.  For
-    # CellFlow this includes its endpoint and population auxiliary terms, so a
-    # checkpoint cannot be called "best" while ignoring the selected
-    # MMD/W2/drift loss configuration.
-    selection_metric = "val_loss_total" if args.loss_mode == "cellflow" else "val_loss_pair"
+    # Select the checkpoint on the objective that is actually optimized, for
+    # every loss mode.  This used to special-case CellFlow and select every
+    # other mode on val_loss_pair, which silently broke --loss-mode chreode:
+    # the run would optimize MMD/W2/drift but pick the epoch that best fit the
+    # per-cell MSE, i.e. the noisy MOSCOT pairing target the distributional
+    # objective exists to avoid.
+    #
+    # For --loss-mode pair_mse this is not a behaviour change: loss == loss_pair
+    # there whenever the expression/latent/source-recon aux weights are 0
+    # (their defaults), so previously-trained pair_mse checkpoints are still
+    # selected identically.
+    selection_metric = "val_loss_total"
     run_config = {
         **vars(args),
         "n_genes": train_dataset.n_genes,
@@ -749,7 +756,7 @@ def main() -> None:
                 f"val_mmd={val_row['metric_mmd']:.6f} val_w2={val_row['metric_w2']:.6f}"
             )
 
-            current_val_metric = val_row["loss"] if args.loss_mode == "cellflow" else val_row["loss_pair"]
+            current_val_metric = val_row["loss"]
             if current_val_metric < best_val_metric:
                 best_val_metric = current_val_metric
                 path = save_checkpoint(

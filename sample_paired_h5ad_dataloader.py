@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import argparse
+import hashlib
 import math
 import random
 import re
@@ -206,6 +207,14 @@ def normalize_probability(prob: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return prob / s
 
 
+def _stable_fold(group: str, num_folds: int, seed: int) -> int:
+    """Fold index for one group, independent of every other group."""
+    digest = hashlib.blake2b(
+        f"{seed}:{group}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % int(num_folds)
+
+
 def compute_group_to_fold(
     data_dir: str | Path,
     group_column: str,
@@ -219,6 +228,22 @@ def compute_group_to_fold(
     scVI training) that must reproduce the identical train/val patient split
     for a given (group_column, num_folds, seed), so that different pipeline
     stages never see leakage between held-out patients.
+
+    The fold is a hash of the group's own identity, NOT its position in a
+    shuffled roster. This matters: an earlier positional implementation
+    (`shuffle(groups)` then `i % num_folds`) made every assignment depend on
+    which *other* groups happened to be present in `data_dir`. Going from the
+    50k directory (406 patients) to the 500k one (408) changed the permutation
+    length and moved 83.5% of patients to a different fold -- so a Stage-1
+    encoder trained on 50k fold-0-train had already seen 68 of the ~82 patients
+    in 500k fold-0-val. Hashing the ID makes membership a property of the
+    patient, so the same patient lands in the same fold at 50k, 500k or 1M, and
+    a checkpoint trained at one scale can be evaluated at another without
+    leaking.
+
+    blake2b rather than the builtin hash(): PYTHONHASHSEED randomizes str
+    hashing per process, which would make folds differ between the trainer and
+    the evaluator in the same pipeline.
     """
     pair_table = Path(data_dir) / "paired_moscot_pairs.tsv"
     if not pair_table.exists():
@@ -226,10 +251,10 @@ def compute_group_to_fold(
     groups = pd.read_csv(
         pair_table, sep="\t", usecols=[group_column], dtype=str
     )[group_column].dropna().astype(str).unique()
-    groups = np.asarray(sorted(groups), dtype=object)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(groups)
-    group_to_fold = {str(group): int(i % num_folds) for i, group in enumerate(groups)}
+    group_to_fold = {
+        str(group): _stable_fold(str(group), num_folds, seed)
+        for group in sorted(groups)
+    }
     if not group_to_fold:
         raise ValueError(f"No groups found for column {group_column!r}")
     return group_to_fold

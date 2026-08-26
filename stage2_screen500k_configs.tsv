@@ -1,0 +1,22 @@
+tag	level	variant	loss_mode	note
+pm_level0_identity	0	default	pair_mse	FLOOR for pair_mse: predicts no change, zero trainable params
+pm_level1_transformer	1	default	pair_mse	plain Transformer residual
+pm_level2_dit	2	default	pair_mse	DiT residual (AdaLN-Zero)
+pm_level3_gated_dit	3	default	pair_mse	+ elapsed-time gate (inert while delta is constant)
+pm_level4_waddington	4	default	pair_mse	potential + rotational + stochastic; best at 50k
+pm_level5_stochastic	5	default	pair_mse	AdaLN-Zero DiT, stochastic residual head
+pm_level5_crossattn	5	cross_attention_dit	pair_mse	tokenized DiT + cross-attention context
+pm_level5_hierarchical	5	hierarchical_dit	pair_mse	U-Net-inspired token DiT
+pm_level5_consistency	5	consistency_dit	pair_mse	direct + residual heads with learned mix
+pm_level6_cellflow	6	default	pair_mse	CellFlow velocity field on the shared objective
+ch_level0_identity	0	default	chreode	FLOOR for chreode: MMD/W2 between pre and post as-is
+ch_level1_transformer	1	default	chreode	plain Transformer residual
+ch_level2_dit	2	default	chreode	DiT residual (AdaLN-Zero)
+ch_level3_gated_dit	3	default	chreode	+ elapsed-time gate (inert while delta is constant)
+ch_level4_waddington	4	default	chreode	potential + rotational + stochastic; best at 50k
+ch_level5_stochastic	5	default	chreode	AdaLN-Zero DiT, stochastic residual head
+ch_level5_crossattn	5	cross_attention_dit	chreode	tokenized DiT + cross-attention context
+ch_level5_hierarchical	5	hierarchical_dit	chreode	U-Net-inspired token DiT
+ch_level5_consistency	5	consistency_dit	chreode	direct + residual heads with learned mix
+ch_level6_cellflow	6	default	chreode	CellFlow velocity field on the distributional objective
+fm_level6_cellflow	6	default	cellflow	CellFlow native flow-matching objective
